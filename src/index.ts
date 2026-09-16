@@ -1,8 +1,24 @@
-// Hey bot
+// <<<<<<< HEAD
+// // Hey bot
+// =======
+// // HEY chatbot
+// >>>>>>> main
 import {
 	createClient,
 	SupabaseClient,
 } from "@supabase/supabase-js";
+import {
+	addItemToCart,
+	clearCart as clearCommerceCart,
+	createOrderFromCart,
+	createRazorpayPaymentLink as createCommercePaymentLink,
+	generateAnswer as generateCommerceAnswer,
+	handleRazorpaySuccessWebhook,
+	updateOrderPaymentLink,
+	upsertConversationState,
+	viewCart,
+} from "./commerce";
+import { generateAnswer, generateRAGResponse } from "./rag";
 
 interface Env {
 	AI: Ai;
@@ -129,6 +145,13 @@ async function sendWhatsAppPayload(
 	const apiUrl =
 		`https://graph.facebook.com/v21.0/${env.PHONE_NUMBER_ID}/messages`;
 
+	console.log("PHONE_NUMBER_ID:", env.PHONE_NUMBER_ID);
+	console.log("WhatsApp API URL:", apiUrl);
+	console.log(
+		"Outgoing WhatsApp Payload:",
+		JSON.stringify(payload, null, 2)
+	);
+
 	const response = await fetch(apiUrl, {
 		method: "POST",
 		headers: {
@@ -139,6 +162,8 @@ async function sendWhatsAppPayload(
 	});
 
 	const result = await response.text();
+
+	console.log("Meta Response:", response.status, result);
 
 	if (!response.ok) {
 		console.error(
@@ -2024,73 +2049,12 @@ async function generateAIResponse(
 	customerMessage: string,
 	env: Env
 ): Promise<string> {
-	try {
-		const result = await env.AI.run(
-			"@cf/meta/llama-3.1-8b-instruct-fast",
-			{
-				messages: [
-					{
-						role: "system",
-						content: [
-							"You are the WhatsApp customer-support assistant for Innova Solutions.",
-							"Be friendly, concise, and professional.",
-							"Keep every response below 500 characters.",
-							"Only provide general assistance about using the chatbot.",
-							"Do not invent products, prices, stock, order information, delivery dates, payment status, or company policies.",
-							"Never claim that an order has been paid.",
-							"Never claim that a payment was successful.",
-							"Never ask for passwords, OTPs, PINs, access tokens, card numbers, CVV values, or security secrets.",
-							"If the customer wants to see products, ask the customer to select View Products.",
-							"If the customer wants to buy something, ask the customer to select a product from the product list.",
-							"If the customer wants to see their cart, ask the customer to select View Cart.",
-							"If the customer wants order status, ask the customer to select Track Order.",
-							"If the customer needs human help, ask the customer to select Customer Care.",
-							"If verified information is not available, clearly say that you do not have verified information.",
-						].join(" "),
-					},
-					{
-						role: "user",
-						content: customerMessage,
-					},
-				],
-				max_tokens: 160,
-			}
-		);
-
-		const aiResult =
-			result as AITextResponse;
-
-		if (
-			typeof aiResult.response === "string" &&
-			aiResult.response.trim().length > 0
-		) {
-			return aiResult.response
-				.trim()
-				.slice(0, 500);
-		}
-
-		console.error(
-			"Unexpected Workers AI response:",
-			JSON.stringify(result)
-		);
-
-		return [
-			"Sorry, I could not answer that question.",
-			"",
-			"Send hi to open the main menu.",
-		].join("\n");
-	} catch (error) {
-		console.error(
-			"Workers AI request failed:",
-			error
-		);
-
-		return [
-			"Sorry, the AI assistant is temporarily unavailable.",
-			"",
-			"Send hi to open the main menu.",
-		].join("\n");
-	}
+	return generateRAGResponse(customerMessage, {
+		AI: env.AI,
+		SUPABASE_URL: env.SUPABASE_URL,
+		SUPABASE_SERVICE_ROLE_KEY: env.SUPABASE_SERVICE_ROLE_KEY,
+		SUPABASE_ANON_KEY: env.SUPABASE_ANON_KEY,
+	});
 }
 export default {
 	async fetch(
@@ -2099,6 +2063,21 @@ export default {
 		ctx: ExecutionContext
 	): Promise<Response> {
 		const url = new URL(request.url);
+		console.log(
+			"[REQUEST]",
+			request.method,
+			url.pathname
+		);
+
+		if (request.method === "GET" && url.pathname === "/message") {
+			console.log("[RETURN] GET /message 200");
+			return new Response("Hello, World!", { status: 200 });
+		}
+
+		if (request.method === "GET" && url.pathname === "/random") {
+			console.log("[RETURN] GET /random 200");
+			return new Response(crypto.randomUUID(), { status: 200 });
+		}
 		/*
 |--------------------------------------------------------------------------
 | Temporary Workers AI test route
@@ -2109,6 +2088,7 @@ if (
 	request.method === "GET" &&
 	url.pathname === "/ai-test"
 ) {
+	console.log("[ROUTE] GET /ai-test");
 	const question =
 		url.searchParams.get(
 			"question"
@@ -2121,6 +2101,7 @@ if (
 			env
 		);
 
+	console.log("[RETURN] GET /ai-test 200");
 	return Response.json({
 		success: true,
 		question,
@@ -2138,6 +2119,7 @@ if (
 			request.method === "GET" &&
 			url.pathname === "/webhook"
 		) {
+			console.log("[WEBHOOK GET] Verification request received");
 			const mode =
 				url.searchParams.get(
 					"hub.mode"
@@ -2158,12 +2140,20 @@ if (
 				token === VERIFY_TOKEN &&
 				challenge
 			) {
+				console.log("[WEBHOOK GET] Verification succeeded");
+				console.log("[RETURN] GET /webhook 200");
 				return new Response(
 					challenge,
 					{ status: 200 }
 				);
 			}
 
+			console.warn("[WEBHOOK GET] Verification failed", {
+				mode,
+				tokenMatched: token === VERIFY_TOKEN,
+				hasChallenge: Boolean(challenge),
+			});
+			console.log("[RETURN] GET /webhook 403");
 			return new Response(
 				"Forbidden",
 				{ status: 403 }
@@ -2181,10 +2171,12 @@ if (
 			url.pathname ===
 				"/razorpay-webhook"
 		) {
-			return processRazorpayWebhook(
-				request,
-				env
-			);
+			console.log("[ROUTE] POST /razorpay-webhook");
+			const rawBody = await request.text();
+			const signature = request.headers.get("x-razorpay-signature") ?? "";
+			const result = await handleRazorpaySuccessWebhook(rawBody, signature, env);
+			console.log("[RETURN] POST /razorpay-webhook delegated", result);
+			return new Response(result.ok ? "Payment processed" : "Payment not processed", { status: result.ok ? 200 : 400 });
 		}
 
 		/*
@@ -2197,8 +2189,19 @@ if (
 			request.method === "POST" &&
 			url.pathname === "/webhook"
 		) {
-			const body: any =
-				await request.json();
+			console.log("[WEBHOOK POST] Handler entered");
+
+			let body: any;
+			try {
+				body = await request.json();
+			} catch (error) {
+				console.error("[WEBHOOK POST] JSON parse failed:", error);
+				console.log("[RETURN] POST /webhook 400");
+				return new Response(
+					"Invalid JSON",
+					{ status: 400 }
+				);
+			}
 
 			console.log(
 				"Incoming WhatsApp Event:",
@@ -2220,6 +2223,8 @@ if (
 			 * do not contain messages[0].
 			 */
 			if (!message) {
+				console.log("[WEBHOOK POST] No message; status event acknowledged");
+				console.log("[RETURN] POST /webhook 200");
 				return new Response(
 					"EVENT_RECEIVED",
 					{ status: 200 }
@@ -2278,11 +2283,13 @@ if (
 								"hello"
 							)
 						) {
+							console.log("[WEBHOOK BRANCH] Main menu");
 							await sendMainMenuButtons(
 								sender,
 								env
 							);
 
+							console.log("[WEBHOOK BRANCH RETURN] Main menu");
 							return;
 						}
 
@@ -2297,11 +2304,20 @@ if (
 							buttonId ===
 								"ADD_MORE_PRODUCTS"
 						) {
+							console.log("[WEBHOOK BRANCH] Product list");
+							await upsertConversationState(
+								sender,
+								"BROWSING_PRODUCTS",
+								env,
+								{ source: "VIEW_PRODUCTS" },
+								incomingText || buttonId || "menu"
+							);
 							await sendProductList(
 								sender,
 								env
 							);
 
+							console.log("[WEBHOOK BRANCH RETURN] Product list");
 							return;
 						}
 
@@ -2317,17 +2333,27 @@ if (
 						if (
 							selectedProductMatch
 						) {
+							console.log("[WEBHOOK BRANCH] Product selection");
 							const productId =
 								Number(
 									selectedProductMatch[1]
 								);
 
-							await addProductToCart(
+							await upsertConversationState(
+								sender,
+								"BROWSING_PRODUCTS",
+								env,
+								{ product_id: productId },
+								`ADD_PRODUCT_${productId}`
+							);
+							await addItemToCart(
 								sender,
 								productId,
+								1,
 								env
 							);
 
+							console.log("[WEBHOOK BRANCH RETURN] Product selection");
 							return;
 						}
 
@@ -2341,11 +2367,31 @@ if (
 							incomingText ===
 								"cart"
 						) {
-							await sendCartSummary(
+							console.log("[WEBHOOK BRANCH] View cart");
+							await upsertConversationState(
 								sender,
-								env
+								"VIEWING_CART",
+								env,
+								{ action: "VIEW_CART" },
+								incomingText || buttonId || "cart"
 							);
+							const { items, total } = await viewCart(sender, env);
+							const cartMessage = items.length
+								? [
+										"🛒 Your Cart",
+										"",
+										...items.map((item) => `${item.product_name}: ${item.quantity} × ₹${item.unit_price}`),
+										"",
+										`Total: ₹${total}`,
+									].join("\n")
+								: [
+										"🛒 Your cart is empty.",
+										"",
+										"Select View Products to add an item.",
+									].join("\n");
+							await sendWhatsAppMessage(sender, cartMessage, env);
 
+							console.log("[WEBHOOK BRANCH RETURN] View cart");
 							return;
 						}
 
@@ -2357,11 +2403,22 @@ if (
 							buttonId ===
 							"CLEAR_CART"
 						) {
-							await clearCart(
+							console.log("[WEBHOOK BRANCH] Clear cart");
+							await upsertConversationState(
 								sender,
+								"VIEWING_CART",
+								env,
+								{ action: "CLEAR_CART" },
+								buttonId
+							);
+							await clearCommerceCart(sender, env);
+							await sendWhatsAppMessage(
+								sender,
+								"🗑️ Your cart has been cleared. Select View Products to continue.",
 								env
 							);
 
+							console.log("[WEBHOOK BRANCH RETURN] Clear cart");
 							return;
 						}
 
@@ -2373,12 +2430,40 @@ if (
 							buttonId ===
 							"CHECKOUT_CART"
 						) {
-							await checkoutCart(
+							console.log("[WEBHOOK BRANCH] Checkout cart");
+							await upsertConversationState(
 								sender,
-								messageId,
-								env
+								"CHECKOUT",
+								env,
+								{ cart_checkout: true },
+								messageId
 							);
+							try {
+								const { order } = await createOrderFromCart(sender, env, messageId);
+								const paymentLink = await createCommercePaymentLink(order, env);
+								await updateOrderPaymentLink(order.id, paymentLink.id, paymentLink.short_url, env);
+								await sendWhatsAppMessage(
+									sender,
+									[
+										"🧾 Order created",
+										"",
+										`Order: #${order.id}`,
+										"",
+										"Complete your payment:",
+										paymentLink.short_url,
+									].join("\n"),
+									env
+								);
+							} catch (error) {
+								console.error("Commerce checkout failed:", error);
+								await sendWhatsAppMessage(
+									sender,
+									"Checkout failed. Please review your cart and try again.",
+									env
+								);
+							}
 
+							console.log("[WEBHOOK BRANCH RETURN] Checkout cart");
 							return;
 						}
 
@@ -2390,11 +2475,20 @@ if (
 							buttonId ===
 							"TRACK_ORDER"
 						) {
+							console.log("[WEBHOOK BRANCH] Latest order");
+							await upsertConversationState(
+								sender,
+								"TRACK_ORDER",
+								env,
+								{ source: "TRACK_ORDER" },
+								buttonId
+							);
 							await processLatestOrder(
 								sender,
 								env
 							);
 
+							console.log("[WEBHOOK BRANCH RETURN] Latest order");
 							return;
 						}
 
@@ -2403,11 +2497,21 @@ if (
 						*/
 
 							if (buttonId === "CUSTOMER_CARE") {
-							await sendCustomerCareMessage(
-							sender,
-							env
+							console.log("[WEBHOOK BRANCH] Customer care");
+							await upsertConversationState(
+								sender,
+								"CUSTOMER_CARE",
+								env,
+								{ source: "CUSTOMER_CARE" },
+								buttonId
 							);
-
+							const answer = await generateCommerceAnswer(
+								"I need customer support and order help.",
+								env,
+								sender,
+								"CUSTOMER_CARE"
+							);
+							await sendWhatsAppMessage(sender, answer, env);
 							return;
 							}
 
@@ -2422,6 +2526,7 @@ if (
 							);
 
 						if (trackMatch) {
+							console.log("[WEBHOOK BRANCH] Track order by ID");
 							const orderId =
 								Number(
 									trackMatch[1]
@@ -2433,6 +2538,7 @@ if (
 								env
 							);
 
+							console.log("[WEBHOOK BRANCH RETURN] Track order by ID");
 							return;
 						}
 
@@ -2446,6 +2552,7 @@ if (
 							);
 
 						if (buyMatch) {
+							console.log("[WEBHOOK BRANCH] Legacy buy command");
 							const productId =
 								Number(
 									buyMatch[1]
@@ -2458,6 +2565,7 @@ if (
 								env
 							);
 
+							console.log("[WEBHOOK BRANCH RETURN] Legacy buy command");
 							return;
 						}
 
@@ -2468,8 +2576,9 @@ if (
 */
 
 if (incomingText) {
+	console.log("[WEBHOOK BRANCH] RAG fallback");
 	console.log(
-		"Sending unknown text to Workers AI:",
+		"Sending unknown text through RAG flow:",
 		{
 			sender,
 			incomingText,
@@ -2477,9 +2586,14 @@ if (incomingText) {
 	);
 
 	const aiReply =
-		await generateAIResponse(
+		await generateAnswer(
 			incomingText,
-			env
+			{
+				AI: env.AI,
+				SUPABASE_URL: env.SUPABASE_URL,
+				SUPABASE_SERVICE_ROLE_KEY: env.SUPABASE_SERVICE_ROLE_KEY,
+				SUPABASE_ANON_KEY: env.SUPABASE_ANON_KEY,
+			}
 		);
 
 	await sendWhatsAppMessage(
@@ -2489,9 +2603,10 @@ if (incomingText) {
 	);
 
 	console.log(
-		"Workers AI WhatsApp reply sent"
+		"RAG-based WhatsApp reply sent"
 	);
 
+	console.log("[WEBHOOK BRANCH RETURN] RAG fallback");
 	return;
 }
 
@@ -2510,6 +2625,8 @@ await sendWhatsAppMessage(
 	].join("\n"),
 	env
 );
+
+						console.log("[WEBHOOK BRANCH] Unsupported message type");
 
 						// await sendWhatsAppMessage(
 						// 	sender,
@@ -2551,12 +2668,14 @@ await sendWhatsAppMessage(
 				})()
 			);
 
+			console.log("[RETURN] POST /webhook 200");
 			return new Response(
 				"EVENT_RECEIVED",
 				{ status: 200 }
 			);
 		}
 
+		console.log("[RETURN] Unmatched route 200");
 		return new Response(
 			"WhatsApp commerce bot is running.",
 			{ status: 200 }
