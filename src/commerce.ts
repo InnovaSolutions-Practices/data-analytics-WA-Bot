@@ -1,8 +1,7 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import {
-  buildContext,
-  extractAIText,
-  normalizeSearchText,
+  generateAnswerFromContext,
+  retrieveKnowledgeContext,
   type ConversationState,
   type RAGContextItem,
   type RAGEnv,
@@ -16,6 +15,326 @@ export interface CustomerRecord {
   metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+}
+
+export type SupportTicketStatus =
+  | 'OPEN'
+  | 'IN_PROGRESS'
+  | 'WAITING_CUSTOMER'
+  | 'WAITING_AGENT'
+  | 'RESOLVED'
+  | 'CLOSED';
+
+export const SUPPORT_TICKET_STATUSES: readonly SupportTicketStatus[] = [
+  'OPEN',
+  'IN_PROGRESS',
+  'WAITING_CUSTOMER',
+  'WAITING_AGENT',
+  'RESOLVED',
+  'CLOSED',
+];
+
+export type SupportTicketPriority = 'LOW' | 'NORMAL' | 'HIGH' | 'URGENT';
+
+export interface SupportTicketRecord {
+  id: number;
+  ticket_number: string;
+  customer_id: number | null;
+  customer_phone: string;
+  order_id: number | null;
+  issue_type: string;
+  issue_description: string | null;
+  product_name: string | null;
+  preferred_resolution: string | null;
+  priority: SupportTicketPriority;
+  status: SupportTicketStatus;
+  created_at: string;
+  updated_at: string;
+  resolved_at: string | null;
+}
+
+export type SupportMessageSenderType = 'CUSTOMER' | 'AGENT';
+
+export interface SupportMessageRecord {
+  id: number;
+  ticket_id: number;
+  sender_type: SupportMessageSenderType;
+  sender_id: string | null;
+  message_text: string;
+  created_at: string;
+}
+
+export type SupportAgentSessionStatus = 'WAITING_FOR_AGENT' | 'ACTIVE' | 'CLOSED';
+
+export interface SupportAgentSessionRecord {
+  id: number;
+  ticket_id: number;
+  customer_phone: string;
+  agent_id: string | null;
+  status: SupportAgentSessionStatus;
+}
+
+export type SupportSessionStatus =
+  | 'DRAFT'
+  | 'COLLECTING_INFO'
+  | 'READY_FOR_ACTION'
+  | 'TICKET_CREATED'
+  | 'WAITING_AGENT'
+  | 'CLOSED'
+  | 'CANCELLED'
+  | 'EXPIRED';
+
+export type SupportSessionStep =
+  | 'ASK_PRODUCT'
+  | 'ASK_ISSUE'
+  | 'ASK_RESOLUTION'
+  | 'ASK_IMAGE'
+  | 'WAITING_USER_DECISION';
+
+export interface SupportSessionRecord {
+  id: number;
+  customer_phone: string;
+  customer_id: number | null;
+  order_id: number | null;
+  issue_type: string;
+  status: SupportSessionStatus;
+  current_step: SupportSessionStep;
+  product_name: string | null;
+  issue_description: string | null;
+  preferred_resolution: string | null;
+  summary_text: string | null;
+  collected_data: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateSupportSessionInput {
+  customerId?: number | null;
+  customerPhone: string;
+  orderId?: number | null;
+  issueType: string;
+  currentStep?: SupportSessionStep;
+  productName?: string | null;
+  issueDescription?: string | null;
+  preferredResolution?: string | null;
+  summaryText?: string | null;
+  collectedData?: Record<string, unknown>;
+}
+
+export function normalizeSupportSessionAnswer(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+export function isAffirmativeAnswer(value: string): boolean {
+  const normalized = normalizeSupportSessionAnswer(value);
+  return /^(yes|y|yeah|yep|correct|sure|affirmative)(?:\b|\s|,)/.test(normalized);
+}
+
+export function isNegativeAnswer(value: string): boolean {
+  const normalized = normalizeSupportSessionAnswer(value);
+  return ['no', 'n', 'nope', 'nah', 'negative'].includes(normalized);
+}
+
+export function isSupportSessionReady(session: Pick<SupportSessionRecord, 'product_name' | 'issue_description' | 'preferred_resolution' | 'collected_data'>): boolean {
+  const collected = session.collected_data ?? {};
+
+  return Boolean(
+    session.product_name &&
+    session.issue_description &&
+    session.preferred_resolution &&
+    (
+      Boolean(collected.product_confirmed) ||
+      Boolean(collected.product_name) ||
+      Boolean(collected.issue_description) ||
+      Boolean(collected.preferred_resolution)
+    )
+  );
+}
+
+export async function createSupportSession(
+  input: CreateSupportSessionInput,
+  env: RAGEnv
+): Promise<SupportSessionRecord> {
+  const client = getAdminClient(env);
+  const { data, error } = await client
+    .from('support_sessions')
+    .insert({
+      customer_phone: input.customerPhone.trim(),
+      customer_id: input.customerId ?? null,
+      order_id: input.orderId ?? null,
+      issue_type: input.issueType.trim(),
+      status: 'DRAFT',
+      current_step: input.currentStep ?? 'ASK_PRODUCT',
+      product_name: input.productName ?? null,
+      issue_description: input.issueDescription ?? null,
+      preferred_resolution: input.preferredResolution ?? null,
+      summary_text: input.summaryText ?? null,
+      collected_data: input.collectedData ?? {},
+    })
+    .select('*')
+    .single();
+
+  if (error || !data) {
+    throw new Error(`Support session creation failed: ${error?.message ?? 'Unknown error'}`);
+  }
+
+  return data as SupportSessionRecord;
+}
+
+export async function getActiveSupportSession(
+  phoneNumber: string,
+  env: RAGEnv
+): Promise<SupportSessionRecord | null> {
+  const client = getAdminClient(env);
+  const { data, error } = await client
+    .from('support_sessions')
+    .select('*')
+    .eq('customer_phone', phoneNumber.trim())
+    .in('status', ['DRAFT', 'COLLECTING_INFO'])
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Active support session lookup failed: ${error.message}`);
+  }
+
+  const session = (data as SupportSessionRecord | null) ?? null;
+  if (session) {
+    console.log('[SUPPORT SESSION MATCH]', {
+      sessionId: session.id,
+      phoneNumber: phoneNumber.trim(),
+      status: session.status,
+      currentStep: session.current_step,
+    });
+  }
+
+  return session;
+}
+
+export async function getLatestTicketCreatedSupportSession(
+  phoneNumber: string,
+  env: RAGEnv
+): Promise<SupportSessionRecord | null> {
+  const client = getAdminClient(env);
+  const { data, error } = await client
+    .from('support_sessions')
+    .select('*')
+    .eq('customer_phone', phoneNumber.trim())
+    .eq('status', 'TICKET_CREATED')
+    .order('id', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Ticket-created support session lookup failed: ${error.message}`);
+  }
+
+  return (data as SupportSessionRecord | null) ?? null;
+}
+
+export async function updateSupportSession(
+  sessionId: number,
+  updates: Partial<Pick<SupportSessionRecord, 'status' | 'current_step' | 'product_name' | 'issue_description' | 'preferred_resolution' | 'summary_text' | 'collected_data'>>,
+  env: RAGEnv
+): Promise<SupportSessionRecord> {
+  const client = getAdminClient(env);
+  const { data, error } = await client
+    .from('support_sessions')
+    .update({
+      ...updates,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', sessionId)
+    .select('*')
+    .single();
+
+  if (error || !data) {
+    throw new Error(`Support session update failed: ${error?.message ?? 'Unknown error'}`);
+  }
+
+  return data as SupportSessionRecord;
+}
+
+export async function attachSupportSessionMedia(
+  sessionId: number,
+  imageId: string,
+  imageUrl: string | null,
+  mimeType: string | null,
+  env: RAGEnv
+): Promise<void> {
+  const client = getAdminClient(env);
+  const { error } = await client
+    .from('support_session_media')
+    .insert({
+      support_session_id: sessionId,
+      media_id: imageId,
+      image_url: imageUrl ?? null,
+      mime_type: mimeType ?? null,
+    });
+
+  if (error) {
+    throw new Error(`Support session media insert failed: ${error.message}`);
+  }
+}
+
+export async function createTicketFromSupportSession(
+  session: SupportSessionRecord,
+  env: RAGEnv
+): Promise<SupportTicketRecord> {
+  if (!isSupportSessionReady(session)) {
+    throw new Error('Support session is not ready to convert into a ticket');
+  }
+
+  if (typeof session.collected_data.image_url === 'string') {
+    console.log('[SUPPORT TICKET IMAGE FIELD SKIPPED]', {
+      sessionId: session.id,
+      reason: 'support_tickets.image_url is not present in the deployed schema',
+    });
+  }
+
+  console.log('[SUPPORT SESSION CLOSED_AT SKIPPED]', {
+    sessionId: session.id,
+    reason: 'support_sessions.closed_at is not present in the deployed schema',
+  });
+
+  const ticket = await createSupportTicket(
+    {
+      customerId: session.customer_id ?? null,
+      customerPhone: session.customer_phone,
+      orderId: session.order_id ?? null,
+      issueType: session.issue_type,
+      issueDescription: session.issue_description,
+      productName: session.product_name,
+      preferredResolution: session.preferred_resolution,
+      priority: 'NORMAL',
+    },
+    env
+  );
+
+  await updateSupportSession(
+    session.id,
+    {
+      status: 'TICKET_CREATED',
+      current_step: 'WAITING_USER_DECISION',
+      summary_text: session.summary_text ?? session.issue_description ?? 'Support session converted to ticket',
+    },
+    env
+  );
+
+  return ticket;
+}
+
+export interface CreateSupportTicketInput {
+  customerId?: number | null;
+  customerPhone: string;
+  orderId?: number | null;
+  issueType: string;
+  issueDescription?: string | null;
+  productName?: string | null;
+  preferredResolution?: string | null;
+  priority?: SupportTicketPriority;
+  ticketNumber?: string;
 }
 
 export interface ProductRecord {
@@ -69,6 +388,37 @@ export interface OrderRecord {
   updated_at: string;
 }
 
+export type OrderStatus =
+  | 'pending'
+  | 'payment_pending'
+  | 'paid'
+  | 'failed'
+  | 'cancelled'
+  | 'fulfilled'
+  | 'PACKED'
+  | 'SHIPPED'
+  | 'OUT_FOR_DELIVERY'
+  | 'DELIVERED';
+
+export interface OrderStatusHistoryRecord {
+  id: number;
+  order_id: number;
+  previous_status: OrderStatus | null;
+  new_status: OrderStatus;
+  changed_by: string | null;
+  changed_by_role: string;
+  reason: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface UpdateOrderStatusOptions {
+  changedBy?: string | null;
+  changedByRole?: string;
+  reason?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
 export interface OrderItemRecord {
   id: number;
   order_id: number;
@@ -103,6 +453,580 @@ export function getAdminClient(env: RAGEnv): SupabaseClient {
       autoRefreshToken: false,
     },
   });
+}
+
+const ORDER_STATUS_TRANSITIONS: Record<OrderStatus, readonly OrderStatus[]> = {
+  pending: ['payment_pending', 'paid', 'failed', 'cancelled'],
+  payment_pending: ['paid', 'failed', 'cancelled'],
+  paid: ['PACKED', 'fulfilled', 'cancelled'],
+  failed: ['payment_pending', 'cancelled'],
+  cancelled: [],
+  fulfilled: [],
+  PACKED: ['SHIPPED', 'cancelled'],
+  SHIPPED: ['OUT_FOR_DELIVERY', 'cancelled'],
+  OUT_FOR_DELIVERY: ['DELIVERED', 'cancelled'],
+  DELIVERED: [],
+};
+
+export function validateStatusTransition(
+  currentStatus: string,
+  nextStatus: string
+): boolean {
+  if (!(currentStatus in ORDER_STATUS_TRANSITIONS) || !(nextStatus in ORDER_STATUS_TRANSITIONS)) {
+    return false;
+  }
+
+  if (currentStatus === nextStatus) {
+    return true;
+  }
+
+  return ORDER_STATUS_TRANSITIONS[currentStatus as OrderStatus].includes(nextStatus as OrderStatus);
+}
+
+export async function getOrderStatus(
+  orderId: number,
+  env: RAGEnv
+): Promise<OrderStatus> {
+  const client = getAdminClient(env);
+  const { data, error } = await client
+    .from('orders')
+    .select('status')
+    .eq('id', orderId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Order status lookup failed: ${error.message}`);
+  }
+
+  if (!data) {
+    throw new Error('Order not found');
+  }
+
+  const status = String(data.status);
+  if (!(status in ORDER_STATUS_TRANSITIONS)) {
+    throw new Error(`Unsupported order status: ${status}`);
+  }
+
+  return status as OrderStatus;
+}
+
+export async function updateOrderStatus(
+  orderId: number,
+  nextStatus: OrderStatus,
+  env: RAGEnv,
+  options: UpdateOrderStatusOptions = {}
+): Promise<OrderRecord> {
+  if (!(nextStatus in ORDER_STATUS_TRANSITIONS)) {
+    throw new Error(`Unsupported order status: ${nextStatus}`);
+  }
+
+  const client = getAdminClient(env);
+  const { data: existingOrder, error: lookupError } = await client
+    .from('orders')
+    .select('*')
+    .eq('id', orderId)
+    .maybeSingle();
+
+  if (lookupError) {
+    throw new Error(`Order lookup failed: ${lookupError.message}`);
+  }
+
+  if (!existingOrder) {
+    throw new Error('Order not found');
+  }
+
+  const previousStatus = String(existingOrder.status);
+  if (!validateStatusTransition(previousStatus, nextStatus)) {
+    throw new Error(`Invalid order status transition: ${previousStatus} -> ${nextStatus}`);
+  }
+
+  if (previousStatus === nextStatus) {
+    return existingOrder as OrderRecord;
+  }
+
+  const { data: updatedOrder, error: updateError } = await client
+    .from('orders')
+    .update({
+      status: nextStatus,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', orderId)
+    .eq('status', previousStatus)
+    .select('*')
+    .maybeSingle();
+
+  if (updateError) {
+    throw new Error(`Order status update failed: ${updateError.message}`);
+  }
+
+  if (!updatedOrder) {
+    throw new Error('Order status update conflicted with another change');
+  }
+
+  const { error: historyError } = await client
+    .from('order_status_history')
+    .insert({
+      order_id: orderId,
+      previous_status: previousStatus,
+      new_status: nextStatus,
+      changed_by: options.changedBy ?? null,
+      changed_by_role: options.changedByRole ?? 'admin',
+      reason: options.reason ?? null,
+      metadata: options.metadata ?? {},
+    });
+
+  if (historyError) {
+    throw new Error(`Order status history insert failed: ${historyError.message}`);
+  }
+
+  const { error: notificationError } = await client
+    .from('notification_events')
+    .insert({
+      order_id: orderId,
+      customer_phone: String(existingOrder.customer_phone),
+      event_type: 'order_status_changed',
+      channel: 'whatsapp',
+      status: 'queued',
+      related_status: nextStatus,
+      payload: {
+        order_id: orderId,
+        previous_status: previousStatus,
+        new_status: nextStatus,
+      },
+      reason: options.reason ?? null,
+    });
+
+  if (notificationError) {
+    throw new Error(`Notification event insert failed: ${notificationError.message}`);
+  }
+
+  return updatedOrder as OrderRecord;
+}
+
+export async function getOrderTimeline(
+  orderId: number,
+  env: RAGEnv
+): Promise<OrderStatusHistoryRecord[]> {
+  const client = getAdminClient(env);
+  const { data, error } = await client
+    .from('order_status_history')
+    .select('*')
+    .eq('order_id', orderId)
+    .order('created_at', { ascending: true })
+    .order('id', { ascending: true });
+
+  if (error) {
+    throw new Error(`Order timeline lookup failed: ${error.message}`);
+  }
+
+  return (data as OrderStatusHistoryRecord[]) ?? [];
+}
+
+const SUPPORT_TICKET_TRANSITIONS: Record<SupportTicketStatus, readonly SupportTicketStatus[]> = {
+  OPEN: ['IN_PROGRESS', 'WAITING_CUSTOMER', 'WAITING_AGENT', 'RESOLVED', 'CLOSED'],
+  IN_PROGRESS: ['WAITING_CUSTOMER', 'WAITING_AGENT', 'RESOLVED', 'CLOSED'],
+  WAITING_CUSTOMER: ['IN_PROGRESS', 'WAITING_AGENT', 'RESOLVED', 'CLOSED'],
+  WAITING_AGENT: ['IN_PROGRESS', 'RESOLVED', 'CLOSED'],
+  RESOLVED: ['IN_PROGRESS', 'CLOSED'],
+  CLOSED: [],
+};
+
+function isSupportTicketStatus(value: string): value is SupportTicketStatus {
+  return SUPPORT_TICKET_STATUSES.includes(value as SupportTicketStatus);
+}
+
+function validateSupportTicketStatusTransition(
+  currentStatus: SupportTicketStatus,
+  nextStatus: SupportTicketStatus
+): boolean {
+  if (!isSupportTicketStatus(currentStatus) || !isSupportTicketStatus(nextStatus)) {
+    return false;
+  }
+
+  return currentStatus === nextStatus || SUPPORT_TICKET_TRANSITIONS[currentStatus].includes(nextStatus);
+}
+
+function createTicketNumber(): string {
+  return `TKT-${Date.now()}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+}
+
+export async function createSupportTicket(
+  input: CreateSupportTicketInput,
+  env: RAGEnv
+): Promise<SupportTicketRecord> {
+  const customerPhone = input.customerPhone.trim();
+  const issueType = input.issueType.trim();
+
+  if (!customerPhone) {
+    throw new Error('Customer phone is required');
+  }
+
+  if (!issueType) {
+    throw new Error('Support ticket issue type is required');
+  }
+
+  const client = getAdminClient(env);
+  const { data, error } = await client
+    .from('support_tickets')
+    .insert({
+      ticket_number: input.ticketNumber?.trim() || createTicketNumber(),
+      customer_id: input.customerId ?? null,
+      customer_phone: customerPhone,
+      order_id: input.orderId ?? null,
+      issue_type: issueType,
+      issue_description: input.issueDescription ?? null,
+      product_name: input.productName ?? null,
+      preferred_resolution: input.preferredResolution ?? null,
+      priority: input.priority ?? 'NORMAL',
+      status: 'OPEN',
+    })
+    .select('*')
+    .single();
+
+  if (error || !data) {
+    throw new Error(`Support ticket creation failed: ${error?.message ?? 'Unknown error'}`);
+  }
+
+  return data as SupportTicketRecord;
+}
+
+export async function addSupportMessage(
+  ticketId: number,
+  senderType: SupportMessageSenderType,
+  messageText: string,
+  env: RAGEnv,
+  senderId?: string | null
+): Promise<SupportMessageRecord> {
+  const trimmedMessage = messageText.trim();
+  if (!trimmedMessage) {
+    throw new Error('Support message is required');
+  }
+
+  const { data, error } = await getAdminClient(env)
+    .from('support_messages')
+    .insert({
+      ticket_id: ticketId,
+      sender_type: senderType,
+      sender_id: senderId ?? null,
+      message_text: trimmedMessage,
+    })
+    .select('*')
+    .single();
+
+  if (error || !data) {
+    throw new Error(`Support message creation failed: ${error?.message ?? 'Unknown error'}`);
+  }
+
+  return data as SupportMessageRecord;
+}
+
+export async function getSupportMessages(
+  ticketId: number,
+  env: RAGEnv
+): Promise<SupportMessageRecord[]> {
+  const { data, error } = await getAdminClient(env)
+    .from('support_messages')
+    .select('*')
+    .eq('ticket_id', ticketId)
+    .order('created_at', { ascending: true })
+    .order('id', { ascending: true });
+
+  if (error) {
+    throw new Error(`Support messages lookup failed: ${error.message}`);
+  }
+
+  return (data as SupportMessageRecord[]) ?? [];
+}
+
+export async function getSupportTicket(
+  ticketId: number,
+  env: RAGEnv
+): Promise<SupportTicketRecord> {
+  const client = getAdminClient(env);
+  const { data, error } = await client
+    .from('support_tickets')
+    .select('*')
+    .eq('id', ticketId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Support ticket lookup failed: ${error.message}`);
+  }
+
+  if (!data) {
+    throw new Error('Support ticket not found');
+  }
+
+  return data as SupportTicketRecord;
+}
+
+export async function getSupportTicketByNumber(
+  ticketNumber: string,
+  env: RAGEnv
+): Promise<SupportTicketRecord> {
+  const normalizedTicketNumber = ticketNumber.trim();
+  if (!normalizedTicketNumber) {
+    throw new Error('Support ticket number is required');
+  }
+
+  const client = getAdminClient(env);
+  const { data, error } = await client
+    .from('support_tickets')
+    .select('*')
+    .eq('ticket_number', normalizedTicketNumber)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Support ticket number lookup failed: ${error.message}`);
+  }
+
+  if (!data) {
+    throw new Error('Support ticket not found');
+  }
+
+  return data as SupportTicketRecord;
+}
+
+export async function getCustomerTickets(
+  customerPhone: string,
+  env: RAGEnv
+): Promise<SupportTicketRecord[]> {
+  const normalizedPhone = customerPhone.trim();
+  if (!normalizedPhone) {
+    return [];
+  }
+
+  const client = getAdminClient(env);
+  const { data, error } = await client
+    .from('support_tickets')
+    .select('*')
+    .eq('customer_phone', normalizedPhone)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    throw new Error(`Customer support ticket lookup failed: ${error.message}`);
+  }
+
+  return (data as SupportTicketRecord[]) ?? [];
+}
+
+export async function getLatestCustomerSupportTicket(
+  phoneNumber: string,
+  env: RAGEnv
+): Promise<SupportTicketRecord | null> {
+  const tickets = await getCustomerTickets(phoneNumber, env);
+  const activeStatuses: readonly SupportTicketStatus[] = [
+    'OPEN',
+    'IN_PROGRESS',
+    'WAITING_CUSTOMER',
+    'WAITING_AGENT',
+  ];
+  const latestTicket = tickets.find((ticket) => activeStatuses.includes(ticket.status));
+
+  console.log('[SUPPORT TICKET LOOKUP] Latest active ticket result', {
+    phoneNumber,
+    ticketId: latestTicket?.id ?? null,
+    ticketNumber: latestTicket?.ticket_number ?? null,
+    status: latestTicket?.status ?? null,
+  });
+
+  return latestTicket ?? null;
+}
+
+export async function getLatestOpenCustomerSupportTicket(
+  phoneNumber: string,
+  env: RAGEnv
+): Promise<SupportTicketRecord | null> {
+  const { data, error } = await getAdminClient(env)
+    .from('support_tickets')
+    .select('*')
+    .eq('customer_phone', phoneNumber.trim())
+    .eq('status', 'OPEN')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Open support ticket lookup failed: ${error.message}`);
+  }
+
+  return (data as SupportTicketRecord | null) ?? null;
+}
+
+export async function createSupportAgentSession(
+  ticketId: number,
+  customerPhone: string,
+  env: RAGEnv
+): Promise<SupportAgentSessionRecord> {
+  const { data, error } = await getAdminClient(env)
+    .from('support_agent_sessions')
+    .insert({
+      ticket_id: ticketId,
+      customer_phone: customerPhone.trim(),
+      agent_id: null,
+      status: 'WAITING_FOR_AGENT',
+    })
+    .select('*')
+    .single();
+
+  if (error || !data) {
+    throw new Error(`Support agent session creation failed: ${error?.message ?? 'Unknown error'}`);
+  }
+
+  return data as SupportAgentSessionRecord;
+}
+
+export async function getWaitingAgentSessions(env: RAGEnv): Promise<SupportAgentSessionRecord[]> {
+  const { data, error } = await getAdminClient(env)
+    .from('support_agent_sessions')
+    .select('*')
+    .eq('status', 'WAITING_FOR_AGENT')
+    .order('id', { ascending: true });
+
+  if (error) {
+    throw new Error(`Waiting agent sessions lookup failed: ${error.message}`);
+  }
+
+  return (data as SupportAgentSessionRecord[]) ?? [];
+}
+
+export async function getSupportAgentSession(
+  sessionId: number,
+  env: RAGEnv
+): Promise<SupportAgentSessionRecord | null> {
+  const { data, error } = await getAdminClient(env)
+    .from('support_agent_sessions')
+    .select('*')
+    .eq('id', sessionId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Support agent session lookup failed: ${error.message}`);
+  }
+
+  return (data as SupportAgentSessionRecord | null) ?? null;
+}
+
+export async function getActiveOrWaitingAgentSessionForTicket(
+  ticketId: number,
+  env: RAGEnv
+): Promise<SupportAgentSessionRecord | null> {
+  const { data, error } = await getAdminClient(env)
+    .from('support_agent_sessions')
+    .select('*')
+    .eq('ticket_id', ticketId)
+    .in('status', ['WAITING_FOR_AGENT', 'ACTIVE'])
+    .order('id', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Agent session lookup for ticket failed: ${error.message}`);
+  }
+
+  return (data as SupportAgentSessionRecord | null) ?? null;
+}
+
+// Atomic: only succeeds if the session was still WAITING_FOR_AGENT at update time,
+// so two agents racing to accept the same session can never both win.
+export async function acceptSupportAgentSession(
+  sessionId: number,
+  agentId: string,
+  env: RAGEnv
+): Promise<SupportAgentSessionRecord | null> {
+  const { data, error } = await getAdminClient(env)
+    .from('support_agent_sessions')
+    .update({ status: 'ACTIVE', agent_id: agentId.trim() })
+    .eq('id', sessionId)
+    .eq('status', 'WAITING_FOR_AGENT')
+    .select('*')
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Support agent session accept failed: ${error.message}`);
+  }
+
+  return (data as SupportAgentSessionRecord | null) ?? null;
+}
+
+export async function closeSupportAgentSession(
+  sessionId: number,
+  env: RAGEnv
+): Promise<SupportAgentSessionRecord | null> {
+  const { data, error } = await getAdminClient(env)
+    .from('support_agent_sessions')
+    .update({ status: 'CLOSED' })
+    .eq('id', sessionId)
+    .neq('status', 'CLOSED')
+    .select('*')
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Support agent session close failed: ${error.message}`);
+  }
+
+  return (data as SupportAgentSessionRecord | null) ?? null;
+}
+
+export async function updateSupportTicketStatus(
+  ticketId: number,
+  nextStatus: SupportTicketStatus,
+  env: RAGEnv
+): Promise<SupportTicketRecord> {
+  if (!isSupportTicketStatus(nextStatus)) {
+    throw new Error(`Unsupported support ticket status: ${String(nextStatus)}`);
+  }
+
+  const ticket = await getSupportTicket(ticketId, env);
+  if (!validateSupportTicketStatusTransition(ticket.status, nextStatus)) {
+    throw new Error(`Invalid support ticket status transition: ${ticket.status} -> ${nextStatus}`);
+  }
+
+  if (ticket.status === nextStatus) {
+    return ticket;
+  }
+
+  console.log('[SUPPORT TICKET STATUS] Updating ticket status', {
+    ticketId,
+    ticketNumber: ticket.ticket_number,
+    previousStatus: ticket.status,
+    nextStatus,
+  });
+
+  const resolvedAt = nextStatus === 'RESOLVED' || nextStatus === 'CLOSED'
+    ? ticket.resolved_at ?? new Date().toISOString()
+    : null;
+
+  const client = getAdminClient(env);
+  const { data, error } = await client
+    .from('support_tickets')
+    .update({
+      status: nextStatus,
+      resolved_at: resolvedAt,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', ticketId)
+    .eq('status', ticket.status)
+    .select('*')
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Support ticket status update failed: ${error.message}`);
+  }
+
+  if (!data) {
+    throw new Error('Support ticket status update conflicted with another change');
+  }
+
+  console.log('[SUPPORT TICKET STATUS] Ticket status updated', {
+    ticketId,
+    ticketNumber: data.ticket_number,
+    previousStatus: ticket.status,
+    nextStatus: data.status,
+    resolvedAt: data.resolved_at,
+  });
+
+  return data as SupportTicketRecord;
 }
 
 export async function upsertCustomer(
@@ -686,94 +1610,20 @@ export async function logInteraction(
   return upsertConversationState(whatsappNumber, state, env, context, message);
 }
 
-export async function searchKnowledgeBase(
-  query: string,
-  env: RAGEnv,
-  limit = 5
-): Promise<RAGContextItem[]> {
-  const client = getAdminClient(env);
-  const cleaned = normalizeSearchText(query);
-  if (!cleaned) {
-    return [];
-  }
-
-  const terms = cleaned.split(' ').filter((term) => term.length > 2).slice(0, 6);
-  if (!terms.length) {
-    return [];
-  }
-
-  const orClause = terms
-    .map((term) => `title.ilike.%${term}%,content.ilike.%${term}%`)
-    .join(',');
-
-  const { data, error } = await client
-    .from('knowledge_base')
-    .select('*')
-    .or(orClause)
-    .limit(limit);
-
-  if (error) {
-    console.warn('Knowledge base lookup failed:', error.message);
-    return [];
-  }
-
-  if (!data || !data.length) {
-    return [];
-  }
-
-  return (data as Array<{ title: string; content: string; source_type?: string; category?: string }>).map((item) => ({
-    title: item.title ?? 'Knowledge article',
-    content: item.content ?? '',
-    source: item.source_type ?? item.category ?? 'knowledge-base',
-    score: 1,
-  }));
-}
-
 export async function generateAnswer(
   question: string,
   env: RAGEnv,
   whatsappNumber?: string,
   state: ConversationState = 'MAIN_MENU'
 ): Promise<string> {
-  const docs = await searchKnowledgeBase(question, env, 5);
-  const prompt = buildContext(docs, question);
+  const docs = await retrieveKnowledgeContext(question, env);
+  const answer = await generateAnswerFromContext(question, docs, env);
 
-  if (!docs.length) {
-    const fallback = 'I do not have verified information for that yet. Please contact Customer Care for assistance.';
-    if (whatsappNumber) {
-      await logInteraction(whatsappNumber, question, [], {}, fallback, state, env);
-    }
-    return fallback;
+  if (whatsappNumber) {
+    await logInteraction(whatsappNumber, question, docs, { selected_documents: docs.slice(0, 3) }, answer, state, env);
   }
 
-  try {
-    const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
-      messages: [
-        {
-          role: 'system',
-          content: 'You are the Innova Solutions commerce assistant. Answer using only the supplied knowledge base context. Keep the reply under 500 characters and never invent product or payment details.',
-        },
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
-      max_tokens: 200,
-    });
-
-    const answer = extractAIText(result)?.trim() ?? 'I do not have verified information for that yet.';
-    if (whatsappNumber) {
-      await logInteraction(whatsappNumber, question, docs, { selected_documents: docs.slice(0, 3) }, answer, state, env);
-    }
-    return answer.slice(0, 500);
-  } catch (error) {
-    console.error('AI answer generation failed:', error);
-    const fallback = 'I do not have verified information for that yet. Please contact Customer Care for assistance.';
-    if (whatsappNumber) {
-      await logInteraction(whatsappNumber, question, docs, { selected_documents: docs.slice(0, 3) }, fallback, state, env);
-    }
-    return fallback;
-  }
+  return answer;
 }
 
 function bytesToHex(bytes: ArrayBuffer): string {
@@ -807,11 +1657,75 @@ async function createRazorpaySignature(rawBody: string, secret: string): Promise
   return bytesToHex(signature).toLowerCase();
 }
 
+// Optimistic-concurrency decrement: reads current stock, then updates only if
+// it still matches what was just read (`.eq('stock', currentStock)`), retrying
+// on conflict. This is the same conditional-update pattern already used by
+// acceptSupportAgentSession/closeSupportAgentSession elsewhere in this file —
+// it uses only the existing `products.stock` column (no new schema), and is
+// genuinely safe under concurrent decrements, unlike a plain read-then-write.
+export async function decrementProductStock(
+  productId: number,
+  quantity: number,
+  env: RAGEnv
+): Promise<void> {
+  if (quantity <= 0) {
+    return;
+  }
+
+  const client = getAdminClient(env);
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const { data: product, error: fetchError } = await client
+      .from('products')
+      .select('id, stock')
+      .eq('id', productId)
+      .maybeSingle();
+
+    if (fetchError) {
+      throw new Error(`Product stock lookup failed: ${fetchError.message}`);
+    }
+
+    if (!product) {
+      console.warn('[INVENTORY DECREMENT] Product not found, skipping', { productId });
+      return;
+    }
+
+    const currentStock = Number(product.stock);
+    const nextStock = Math.max(0, currentStock - quantity);
+
+    const { data: updated, error: updateError } = await client
+      .from('products')
+      .update({ stock: nextStock })
+      .eq('id', productId)
+      .eq('stock', currentStock)
+      .select('id')
+      .maybeSingle();
+
+    if (updateError) {
+      throw new Error(`Product stock update failed: ${updateError.message}`);
+    }
+
+    if (updated) {
+      console.log('[INVENTORY DECREMENT]', {
+        productId,
+        quantity,
+        previousStock: currentStock,
+        newStock: nextStock,
+      });
+      return;
+    }
+
+    // Someone else updated stock between our read and write; retry with a fresh read.
+  }
+
+  throw new Error(`Could not update stock for product ${productId} after retries (concurrent update contention)`);
+}
+
 export async function handleRazorpaySuccessWebhook(
   rawBody: string,
   signature: string,
   env: CommerceEnv
-): Promise<{ ok: boolean; orderId?: number }> {
+): Promise<{ ok: boolean; orderId?: number; customerPhone?: string; totalAmount?: number }> {
   const expectedSignature = await createRazorpaySignature(rawBody, env.RAZORPAY_WEBHOOK_SECRET);
   const isValid = safeCompare(expectedSignature, signature.toLowerCase());
   if (!isValid) {
@@ -826,7 +1740,14 @@ export async function handleRazorpaySuccessWebhook(
     };
   };
 
+  // Logged unconditionally, before the event-type filter below, so we can see
+  // exactly what Razorpay is actually sending regardless of whether it matches.
+  console.log('[RAZORPAY WEBHOOK] event.event:', event.event);
+  console.log('[RAZORPAY WEBHOOK] payment_link_id:', event.payload?.payment_link?.entity?.id);
+  console.log('[RAZORPAY WEBHOOK] payment_id:', event.payload?.payment?.entity?.id);
+
   if (event.event !== 'payment_link.paid') {
+    console.log('[RAZORPAY WEBHOOK] event ignored (does not match payment_link.paid):', event.event);
     return { ok: true };
   }
 
@@ -842,6 +1763,14 @@ export async function handleRazorpaySuccessWebhook(
     .eq('razorpay_payment_link_id', linkId)
     .maybeSingle();
 
+  console.log('[RAZORPAY WEBHOOK] order lookup result:', {
+    linkId,
+    found: Boolean(order),
+    orderId: order?.id ?? null,
+    currentStatus: order?.status ?? null,
+    error: error?.message ?? null,
+  });
+
   if (error) {
     throw new Error(`Order lookup for payment failed: ${error.message}`);
   }
@@ -850,8 +1779,25 @@ export async function handleRazorpaySuccessWebhook(
     throw new Error('Order not found for payment link');
   }
 
+  // Idempotency guard: Razorpay may redeliver the same payment_link.paid
+  // event. orders.status is the existing signal for "already processed" —
+  // no new column/table needed. The .eq('status', order.status) below also
+  // closes the race window for two near-simultaneous deliveries: only the
+  // request that actually flips the row proceeds to decrement inventory.
+  if (order.status === 'paid') {
+    console.log('[RAZORPAY WEBHOOK] Duplicate payment_link.paid ignored (order already paid)', {
+      orderId: order.id,
+    });
+    return {
+      ok: true,
+      orderId: Number(order.id),
+      customerPhone: order.customer_phone,
+      totalAmount: Number(order.total_amount),
+    };
+  }
+
   const paymentEntity = event.payload?.payment?.entity ?? {};
-  const { error: updateError } = await client
+  const { data: updatedOrder, error: updateError } = await client
     .from('orders')
     .update({
       status: 'paid',
@@ -859,11 +1805,46 @@ export async function handleRazorpaySuccessWebhook(
       paid_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     })
-    .eq('id', order.id);
+    .eq('id', order.id)
+    .eq('status', order.status)
+    .select('id')
+    .maybeSingle();
+
+  console.log('[RAZORPAY WEBHOOK] order update result:', {
+    orderId: order.id,
+    success: !updateError && Boolean(updatedOrder),
+    error: updateError?.message ?? null,
+  });
 
   if (updateError) {
     throw new Error(`Order payment completion failed: ${updateError.message}`);
   }
 
-  return { ok: true, orderId: Number(order.id) };
+  if (updatedOrder) {
+    const { data: orderItems, error: itemsError } = await client
+      .from('order_items')
+      .select('product_id, quantity')
+      .eq('order_id', order.id);
+
+    if (itemsError) {
+      throw new Error(`Order items lookup for inventory decrement failed: ${itemsError.message}`);
+    }
+
+    for (const item of orderItems ?? []) {
+      if (item.product_id) {
+        await decrementProductStock(Number(item.product_id), Number(item.quantity), env);
+      }
+    }
+  } else {
+    console.log('[RAZORPAY WEBHOOK] Order status changed concurrently; skipping duplicate inventory decrement', {
+      orderId: order.id,
+    });
+  }
+
+  return {
+    ok: true,
+    orderId: Number(order.id),
+    customerPhone: order.customer_phone,
+    totalAmount: Number(order.total_amount),
+  };
 }

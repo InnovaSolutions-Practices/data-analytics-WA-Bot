@@ -5,16 +5,9 @@ export interface RAGEnv {
 	SUPABASE_URL: string;
 	SUPABASE_SERVICE_ROLE_KEY: string;
 	SUPABASE_ANON_KEY: string;
-}
-
-export interface KnowledgeDoc {
-	id?: number;
-	title: string;
-	content: string;
-	source_type?: string;
-	category?: string;
-	product_id?: number | null;
-	score?: number;
+	OPENAI_API_KEY: string;
+	OPENAI_CHAT_MODEL?: string;
+	RAG_MATCH_THRESHOLD?: string;
 }
 
 export interface RAGContextItem {
@@ -40,6 +33,11 @@ export const CONVERSATION_STATES: ConversationState[] = [
 	'TRACK_ORDER',
 	'CUSTOMER_CARE',
 ];
+
+const EMBEDDING_MODEL = 'text-embedding-3-small';
+const DEFAULT_CHAT_MODEL = 'gpt-4o-mini';
+const DEFAULT_MATCH_THRESHOLD = 0.3;
+const NO_CONFIDENCE_MESSAGE = "I don't have enough verified information.";
 
 export function normalizeSearchText(value: string): string {
 	return value
@@ -98,7 +96,7 @@ export function buildContext(context: RAGContextItem[], question: string): strin
 	return [
 		'You are the Innova Solutions customer-support assistant.',
 		'Use only the information in the context below to answer the user.',
-		'If the answer is not available in the context, say: "I do not have verified information for that yet."',
+		`If the answer is not available in the context, say: "${NO_CONFIDENCE_MESSAGE}"`,
 		'Do not invent products, prices, stock availability, order details, payment status, or company policies.',
 		'',
 		'Context:',
@@ -113,179 +111,119 @@ export function buildRAGPrompt(question: string, context: RAGContextItem[]): str
 	return buildContext(context, question);
 }
 
-export function extractAIText(result: unknown): string | null {
-	if (!result || typeof result !== 'object') {
-		return null;
-	}
+/*
+|--------------------------------------------------------------------------
+| PDF chunking
+|--------------------------------------------------------------------------
+| Shared by the ingestion script (scripts/ingest-pdf.ts) and available here
+| so both sides of the pipeline chunk text identically.
+*/
 
-	const record = result as Record<string, unknown>;
+export function chunkText(text: string, chunkSize = 1000, overlap = 150): string[] {
+	const paragraphs = text
+		.split(/\n{2,}/)
+		.map((paragraph) => paragraph.replace(/\s+/g, ' ').trim())
+		.filter((paragraph) => paragraph.length > 0);
 
-	if (typeof record.response === 'string' && record.response.trim().length > 0) {
-		return record.response.trim();
-	}
+	const chunks: string[] = [];
+	let current = '';
 
-	if (typeof record.answer === 'string' && record.answer.trim().length > 0) {
-		return record.answer.trim();
-	}
+	for (const paragraph of paragraphs) {
+		const candidate = current ? `${current}\n\n${paragraph}` : paragraph;
 
-	if (Array.isArray(record.output)) {
-		const outputText = record.output
-			.map((entry) => {
-				if (typeof entry === 'string') {
-					return entry;
-				}
+		if (candidate.length <= chunkSize) {
+			current = candidate;
+			continue;
+		}
 
-				if (entry && typeof entry === 'object') {
-					const outputEntry = entry as Record<string, unknown>;
-					if (typeof outputEntry.text === 'string') {
-						return outputEntry.text;
-					}
-				}
+		if (current) {
+			chunks.push(current);
+			const tail = current.slice(Math.max(0, current.length - overlap));
+			current = `${tail}\n\n${paragraph}`.trim();
+		} else {
+			current = paragraph;
+		}
 
-				return '';
-			})
-			.join('')
-			.trim();
-
-		if (outputText.length > 0) {
-			return outputText;
+		while (current.length > chunkSize) {
+			chunks.push(current.slice(0, chunkSize));
+			current = current.slice(chunkSize - overlap);
 		}
 	}
 
-	return null;
+	if (current.trim()) {
+		chunks.push(current.trim());
+	}
+
+	return chunks;
 }
 
-async function searchKnowledgeBaseTable(
-	query: string,
-	env: RAGEnv,
-	limit = 5
-): Promise<RAGContextItem[]> {
-	const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
-		auth: {
-			persistSession: false,
-			autoRefreshToken: false,
+/*
+|--------------------------------------------------------------------------
+| OpenAI helpers
+|--------------------------------------------------------------------------
+| Plain `fetch` calls (no SDK) to keep the Worker bundle small and match the
+| rest of this codebase's style (see the Razorpay integration in commerce.ts).
+*/
+
+export async function embedTexts(texts: string[], apiKey: string): Promise<number[][]> {
+	if (texts.length === 0) {
+		return [];
+	}
+
+	const BATCH_SIZE = 96;
+	const vectors: number[][] = [];
+
+	for (let offset = 0; offset < texts.length; offset += BATCH_SIZE) {
+		const batch = texts.slice(offset, offset + BATCH_SIZE);
+		const response = await fetch('https://api.openai.com/v1/embeddings', {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${apiKey}`,
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				model: EMBEDDING_MODEL,
+				input: batch,
+			}),
+		});
+
+		if (!response.ok) {
+			const errorBody = await response.text();
+			throw new Error(`OpenAI embeddings request failed (${response.status}): ${errorBody}`);
+		}
+
+		const payload = (await response.json()) as { data: Array<{ embedding: number[]; index: number }> };
+		const sorted = [...payload.data].sort((a, b) => a.index - b.index);
+		vectors.push(...sorted.map((item) => item.embedding));
+	}
+
+	return vectors;
+}
+
+export async function embedQuery(query: string, apiKey: string): Promise<number[]> {
+	const [vector] = await embedTexts([query], apiKey);
+	return vector;
+}
+
+async function generateChatAnswer(prompt: string, env: RAGEnv): Promise<string | null> {
+	const model = env.OPENAI_CHAT_MODEL || DEFAULT_CHAT_MODEL;
+
+	const response = await fetch('https://api.openai.com/v1/chat/completions', {
+		method: 'POST',
+		headers: {
+			Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+			'Content-Type': 'application/json',
 		},
-	});
-
-	const searchTerms = normalizeSearchText(query)
-		.split(' ')
-		.filter((term) => term.length > 2)
-		.slice(0, 6);
-
-	if (searchTerms.length === 0) {
-		return [];
-	}
-
-	const orClause = searchTerms
-		.map((term) => `title.ilike.%${term}%,content.ilike.%${term}%`)
-		.join(',');
-
-	const { data, error } = await supabase
-		.from('knowledge_base')
-		.select('id, title, content, source_type, category')
-		.or(orClause)
-		.limit(limit);
-
-	if (error) {
-		console.warn('Knowledge base search failed:', error.message);
-		return [];
-	}
-
-	if (!data || data.length === 0) {
-		return [];
-	}
-
-	return (data as KnowledgeDoc[]).map((item) => ({
-		title: item.title || 'Knowledge article',
-		content: item.content || '',
-		source: item.source_type || item.category || 'knowledge-base',
-		score: 1,
-	}));
-}
-
-async function searchProductFallback(query: string, env: RAGEnv, limit = 5): Promise<RAGContextItem[]> {
-	const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
-		auth: {
-			persistSession: false,
-			autoRefreshToken: false,
-		},
-	});
-
-	const searchTerms = normalizeSearchText(query)
-		.split(' ')
-		.filter((term) => term.length > 2)
-		.slice(0, 6);
-
-	if (searchTerms.length === 0) {
-		return [];
-	}
-
-	const orClause = searchTerms
-		.map((term) => `name.ilike.%${term}%,description.ilike.%${term}%`)
-		.join(',');
-
-	const { data, error } = await supabase
-		.from('products')
-		.select('id, name, description, price')
-		.or(orClause)
-		.limit(limit);
-
-	if (error || !data || data.length === 0) {
-		return [];
-	}
-
-	return (data as Array<{ id: number; name: string; description: string | null; price: number }>).map(
-		(item) => ({
-			title: item.name,
-			content: item.description
-				? `${item.name}: ${item.description}. Price: ₹${item.price}.`
-				: `${item.name}: price ₹${item.price}.`,
-			source: 'products',
-			score: 1,
-		})
-	);
-}
-
-export async function searchKnowledgeBase(
-	query: string,
-	env: RAGEnv,
-	limit = 5
-): Promise<RAGContextItem[]> {
-	const cleanedQuestion = query.trim();
-	if (!cleanedQuestion) {
-		return [];
-	}
-	
-	const fromKnowledgeBase = await searchKnowledgeBaseTable(cleanedQuestion, env, limit);
-	if (fromKnowledgeBase.length > 0) {
-		return fromKnowledgeBase;
-	}
-	
-	return searchProductFallback(cleanedQuestion, env, limit);
-}
-
-export async function retrieveKnowledgeContext(question: string, env: RAGEnv): Promise<RAGContextItem[]> {
-	return searchKnowledgeBase(question, env, 5);
-}
-
-export async function generateAnswer(question: string, env: RAGEnv): Promise<string> {
-	const context = await retrieveKnowledgeContext(question, env);
-	if (context.length === 0) {
-		return 'I do not have verified information for that yet. Please contact Customer Care for assistance.';
-	}
-
-	const prompt = buildRAGPrompt(question, context);
-
-	try {
-		const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
+		body: JSON.stringify({
+			model,
 			messages: [
 				{
 					role: 'system',
 					content: [
 						'You are the Innova Solutions WhatsApp commerce assistant.',
-						'Answer using only the context provided.',
+						'Answer using only the context provided in the prompt.',
 						'Keep the response under 500 characters.',
-						'If the answer is not in the context, say: I do not have verified information for that yet.',
+						`If the answer is not in the context, say exactly: ${NO_CONFIDENCE_MESSAGE}`,
 					].join(' '),
 				},
 				{
@@ -293,22 +231,114 @@ export async function generateAnswer(question: string, env: RAGEnv): Promise<str
 					content: prompt,
 				},
 			],
-			max_tokens: 180,
-		});
+			max_tokens: 220,
+			temperature: 0.2,
+		}),
+	});
 
-		const aiText = extractAIText(result);
-		if (aiText) {
-			return aiText.trim().slice(0, 500);
+	if (!response.ok) {
+		const errorBody = await response.text();
+		throw new Error(`OpenAI chat completion failed (${response.status}): ${errorBody}`);
+	}
+
+	const payload = (await response.json()) as {
+		choices?: Array<{ message?: { content?: string } }>;
+	};
+
+	return payload.choices?.[0]?.message?.content?.trim() ?? null;
+}
+
+/*
+|--------------------------------------------------------------------------
+| Vector retrieval
+|--------------------------------------------------------------------------
+*/
+
+interface RagDocumentMatch {
+	id: number;
+	source: string;
+	chunk_index: number;
+	content: string;
+	metadata: Record<string, unknown> | null;
+	similarity: number;
+}
+
+export async function retrieveKnowledgeContext(question: string, env: RAGEnv): Promise<RAGContextItem[]> {
+	const cleanedQuestion = question.trim();
+	if (!cleanedQuestion) {
+		return [];
+	}
+
+	const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
+		auth: {
+			persistSession: false,
+			autoRefreshToken: false,
+		},
+	});
+
+	const matchThreshold = env.RAG_MATCH_THRESHOLD ? Number(env.RAG_MATCH_THRESHOLD) : DEFAULT_MATCH_THRESHOLD;
+	const queryEmbedding = await embedQuery(cleanedQuestion, env.OPENAI_API_KEY);
+
+	console.log('RAG threshold:', matchThreshold);
+
+	const { data, error } = await supabase.rpc('match_rag_documents', {
+		query_embedding: queryEmbedding,
+		match_count: 5,
+		match_threshold: matchThreshold,
+	});
+
+	if (error) {
+		console.error('pgvector similarity search failed:', error.message);
+		return [];
+	}
+
+	const results = (data as RagDocumentMatch[] | null) ?? [];
+	console.log('Retrieved chunks:', results.length);
+	console.log(results.map((row) => ({ id: row.id, similarity: row.similarity })));
+
+	return results.map((row) => ({
+		title: typeof row.metadata?.title === 'string' ? (row.metadata.title as string) : `${row.source} #${row.chunk_index}`,
+		content: row.content,
+		source: row.source,
+		score: row.similarity,
+	}));
+}
+
+/*
+|--------------------------------------------------------------------------
+| Answer generation
+|--------------------------------------------------------------------------
+| question -> embedding -> pgvector similarity search -> top 5 chunks
+| -> GPT prompt -> answer. Below the confidence threshold, no GPT call is
+| made and the fixed low-confidence message is returned instead.
+*/
+
+export async function generateAnswerFromContext(
+	question: string,
+	context: RAGContextItem[],
+	env: RAGEnv
+): Promise<string> {
+	if (context.length === 0) {
+		return NO_CONFIDENCE_MESSAGE;
+	}
+
+	const prompt = buildRAGPrompt(question, context);
+
+	try {
+		const answer = await generateChatAnswer(prompt, env);
+		if (answer) {
+			return answer.slice(0, 500);
 		}
 	} catch (error) {
 		console.error('RAG generation failed:', error);
 	}
 
-	return context
-		.slice(0, 1)
-		.map((item) => `${item.title}: ${item.content}`)
-		.join('\n')
-		.slice(0, 500);
+	return NO_CONFIDENCE_MESSAGE;
+}
+
+export async function generateAnswer(question: string, env: RAGEnv): Promise<string> {
+	const context = await retrieveKnowledgeContext(question, env);
+	return generateAnswerFromContext(question, context, env);
 }
 
 export async function generateRAGResponse(question: string, env: RAGEnv): Promise<string> {

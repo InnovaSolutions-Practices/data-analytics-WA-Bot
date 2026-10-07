@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>Support Agent Console</title>
+		<style>
+			body { font-family: system-ui, sans-serif; margin: 0; display: flex; height: 100vh; }
+			#setup { margin: auto; max-width: 360px; }
+			#setup input { width: 100%; margin-bottom: 8px; padding: 6px; box-sizing: border-box; }
+			#app { display: none; width: 100%; height: 100%; }
+			#queue { width: 320px; border-right: 1px solid #ccc; overflow-y: auto; padding: 8px; box-sizing: border-box; }
+			#conversation { flex: 1; display: flex; flex-direction: column; padding: 8px; box-sizing: border-box; }
+			.session-card { border: 1px solid #ddd; border-radius: 6px; padding: 8px; margin-bottom: 8px; }
+			.session-card h4 { margin: 0 0 4px; }
+			.session-card p { margin: 2px 0; font-size: 13px; color: #444; }
+			.session-card button { margin-top: 6px; }
+			.msg-list { flex: 1; overflow-y: auto; border: 1px solid #ddd; border-radius: 6px; padding: 8px; margin-bottom: 8px; }
+			.msg { margin-bottom: 6px; padding: 6px 8px; border-radius: 6px; max-width: 70%; }
+			.msg.CUSTOMER { background: #eef; align-self: flex-start; }
+			.msg.AGENT { background: #dfd; align-self: flex-end; margin-left: auto; }
+			.reply-row { display: flex; gap: 6px; }
+			.reply-row input { flex: 1; padding: 6px; }
+			#no-session { color: #888; margin: auto; }
+			.error { color: #b00; font-size: 13px; }
+			.thumb { max-width: 120px; display: block; margin: 4px 0; }
+		</style>
+	</head>
+	<body>
+		<div id="setup">
+			<h2>Support Agent Console</h2>
+			<label>Admin API token<input id="token-input" type="password" /></label>
+			<label>Your Agent ID (short name or code — e.g. "Priya" or "agent-042". This is NOT a message to the customer.)<input id="agent-input" type="text" placeholder="e.g. Priya" /></label>
+			<button id="setup-submit" type="button">Continue</button>
+			<p id="setup-error" class="error"></p>
+		</div>
+
+		<div id="app">
+			<div id="queue">
+				<h3>Waiting for agent</h3>
+				<div id="queue-list"></div>
+			</div>
+			<div id="conversation">
+				<div id="no-session">Select a waiting session to accept it.</div>
+			</div>
+		</div>
+
+		<script>
+			const state = {
+				token: localStorage.getItem('agentConsoleToken') || '',
+				agentId: localStorage.getItem('agentConsoleAgentId') || '',
+				activeSessionId: null,
+				activeTicketId: null,
+			};
+
+			function authHeaders() {
+				return {
+					'Content-Type': 'application/json',
+					Authorization: `Bearer ${state.token}`,
+				};
+			}
+
+			async function api(path, options) {
+				const response = await fetch(path, {
+					...options,
+					headers: authHeaders(),
+				});
+				const body = await response.json().catch(() => ({}));
+				if (!response.ok) {
+					throw new Error(body.error || `Request failed (${response.status})`);
+				}
+				return body;
+			}
+
+			function showApp() {
+				document.getElementById('setup').style.display = 'none';
+				document.getElementById('app').style.display = 'flex';
+				refreshQueue();
+				setInterval(refreshQueue, 5000);
+				setInterval(refreshConversation, 3000);
+			}
+
+			function looksLikeAgentId(value) {
+				if (!value || value.length > 40) return false;
+				if (value.includes('?')) return false;
+				return value.split(/\s+/).length <= 4;
+			}
+
+			document.getElementById('setup-submit').addEventListener('click', () => {
+				const token = document.getElementById('token-input').value.trim();
+				const agentId = document.getElementById('agent-input').value.trim();
+				if (!token || !agentId) {
+					document.getElementById('setup-error').textContent = 'Both fields are required.';
+					return;
+				}
+				if (!looksLikeAgentId(agentId)) {
+					document.getElementById('setup-error').textContent =
+						'That looks like a message, not an agent ID. Enter a short name or code (e.g. "Priya") — you\'ll type your reply to the customer in the chat box after accepting a session.';
+					return;
+				}
+				state.token = token;
+				state.agentId = agentId;
+				localStorage.setItem('agentConsoleToken', token);
+				localStorage.setItem('agentConsoleAgentId', agentId);
+				showApp();
+			});
+
+			async function refreshQueue() {
+				try {
+					const data = await api('/api/admin/agent-queue');
+					renderQueue(data.queue || []);
+				} catch (error) {
+					console.error('Queue refresh failed', error);
+				}
+			}
+
+			function renderQueue(queue) {
+				const list = document.getElementById('queue-list');
+				list.innerHTML = '';
+				if (queue.length === 0) {
+					list.innerHTML = '<p>No customers waiting.</p>';
+					return;
+				}
+
+				for (const item of queue) {
+					const card = document.createElement('div');
+					card.className = 'session-card';
+					const lastMessages = (item.latest_messages || [])
+						.map((m) => `<p><strong>${m.sender_type}:</strong> ${escapeHtml(m.message_text)}</p>`)
+						.join('');
+					const images = (item.images || [])
+						.map((img) => (img.image_url ? `<a href="${img.image_url}" target="_blank">image</a>` : `<span>media ${img.media_id}</span>`))
+						.join(', ');
+
+					card.innerHTML = `
+						<h4>Ticket ${item.ticket_number}</h4>
+						<p>Customer: ${item.customer_phone}</p>
+						<p>Issue: ${item.issue_type}</p>
+						${lastMessages}
+						${images ? `<p>Images: ${images}</p>` : ''}
+						<p>Status: Waiting for agent</p>
+						<button type="button" data-session-id="${item.session_id}">Accept Chat</button>
+					`;
+					const acceptButton = card.querySelector('button');
+					acceptButton.addEventListener('click', () => acceptSession(item.session_id, acceptButton));
+					list.appendChild(card);
+				}
+			}
+
+			async function acceptSession(sessionId, buttonEl) {
+				if (buttonEl) buttonEl.disabled = true;
+				try {
+					const data = await api(`/api/admin/agent-sessions/${sessionId}/accept`, {
+						method: 'POST',
+						body: JSON.stringify({ agentId: state.agentId }),
+					});
+					state.activeSessionId = data.session.id;
+					state.activeTicketId = data.session.ticket_id;
+					renderConversationShell(data.ticket);
+					refreshConversation();
+					refreshQueue();
+				} catch (error) {
+					alert(error.message);
+					if (buttonEl) buttonEl.disabled = false;
+				}
+			}
+
+			function renderConversationShell(ticket) {
+				const container = document.getElementById('conversation');
+				container.innerHTML = `
+					<h3>Ticket ${ticket.ticket_number}</h3>
+					<div id="msg-list" class="msg-list"></div>
+					<div class="reply-row">
+						<input id="reply-input" type="text" placeholder="Type a reply..." />
+						<button id="reply-send" type="button">Send</button>
+						<button id="end-chat" type="button">End Chat</button>
+					</div>
+					<p id="conversation-error" class="error"></p>
+				`;
+				document.getElementById('reply-send').addEventListener('click', sendReply);
+				document.getElementById('reply-input').addEventListener('keydown', (e) => {
+					if (e.key === 'Enter') sendReply();
+				});
+				document.getElementById('end-chat').addEventListener('click', endChat);
+			}
+
+			function renderConversationItem(m) {
+				if (m.type === 'IMAGE') {
+					const inner = m.image_url
+						? `<img class="thumb" src="${m.image_url}" alt="Customer attachment" onerror="this.replaceWith(document.createTextNode('📎 Image attachment (unavailable)'));" />`
+						: `📎 Image attachment${m.media_id ? ` (id: ${escapeHtml(m.media_id)})` : ''}`;
+					return `<div class="msg ${m.sender_type}">${inner}</div>`;
+				}
+				return `<div class="msg ${m.sender_type}">${escapeHtml(m.message_text)}</div>`;
+			}
+
+			async function refreshConversation() {
+				if (!state.activeTicketId) return;
+				try {
+					const data = await api(`/api/admin/tickets/${state.activeTicketId}/messages`);
+
+					if (data.ticket_status === 'CLOSED') {
+						document.getElementById('conversation').innerHTML = '<div id="no-session">Customer ended the chat.</div>';
+						state.activeSessionId = null;
+						state.activeTicketId = null;
+						refreshQueue();
+						return;
+					}
+
+					const list = document.getElementById('msg-list');
+					if (!list) return;
+					list.innerHTML = (data.messages || [])
+						.map(renderConversationItem)
+						.join('');
+					list.scrollTop = list.scrollHeight;
+				} catch (error) {
+					console.error('Conversation refresh failed', error);
+				}
+			}
+
+			async function sendReply() {
+				const input = document.getElementById('reply-input');
+				const sendButton = document.getElementById('reply-send');
+				const message = input.value.trim();
+				if (!message || !state.activeSessionId) return;
+
+				sendButton.disabled = true;
+				document.getElementById('conversation-error').textContent = '';
+				try {
+					await api(`/api/admin/agent-sessions/${state.activeSessionId}/reply`, {
+						method: 'POST',
+						body: JSON.stringify({ agentId: state.agentId, message }),
+					});
+					input.value = '';
+					refreshConversation();
+				} catch (error) {
+					document.getElementById('conversation-error').textContent = error.message;
+				} finally {
+					sendButton.disabled = false;
+				}
+			}
+
+			async function endChat() {
+				if (!state.activeSessionId) return;
+				if (!confirm('End this support conversation?')) return;
+
+				const endButton = document.getElementById('end-chat');
+				endButton.disabled = true;
+				document.getElementById('conversation-error').textContent = '';
+				try {
+					await api(`/api/admin/agent-sessions/${state.activeSessionId}/end`, {
+						method: 'POST',
+						body: JSON.stringify({ agentId: state.agentId }),
+					});
+					state.activeSessionId = null;
+					state.activeTicketId = null;
+					document.getElementById('conversation').innerHTML = '<div id="no-session">Chat ended successfully.</div>';
+					refreshQueue();
+				} catch (error) {
+					document.getElementById('conversation-error').textContent = error.message;
+					endButton.disabled = false;
+				}
+			}
+
+			function escapeHtml(value) {
+				const div = document.createElement('div');
+				div.textContent = value == null ? '' : String(value);
+				return div.innerHTML;
+			}
+
+			if (state.token && state.agentId) {
+				showApp();
+			}
+		</script>
+	</body>
+</html>
