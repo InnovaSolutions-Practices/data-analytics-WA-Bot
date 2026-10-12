@@ -1371,11 +1371,13 @@ export async function createOrderFromCart(
     throw new Error('Cart is empty');
   }
 
+  const customer = await upsertCustomer(whatsappNumber, env);
   const client = getAdminClient(env);
   const subtotal = calculateCartTotal(items);
   const orderInsert = await client
     .from('orders')
     .insert({
+      customer_id: customer.id,
       customer_phone: whatsappNumber,
       meta_message_id: metaMessageId ?? null,
       status: 'pending',
