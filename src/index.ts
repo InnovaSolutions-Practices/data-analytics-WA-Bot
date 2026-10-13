@@ -20,6 +20,9 @@ import {
 	createOrderFromCart,
 	createRazorpayPaymentLink as createCommercePaymentLink,
 	createSupportTicket,
+	ensurePendingOrderDelivery,
+	getConversationState,
+	getOrderDeliveryDetails,
 	getActiveOrWaitingAgentSessionForTicket,
 	getActiveSupportSession,
 	getOrderStatus,
@@ -34,16 +37,21 @@ import {
 	isNegativeAnswer,
 	getSupportTicket,
 	handleRazorpaySuccessWebhook,
+	saveDeliveryAddressForOrder,
+	setOrderDeliveryResponse,
 	normalizeSupportSessionAnswer,
 	SUPPORT_TICKET_STATUSES,
 	updateSupportSession,
 	updateOrderStatus,
+	updateOrderDeliveryStatus,
 	updateSupportTicketStatus,
 	updateOrderPaymentLink,
 	upsertConversationState,
 	viewCart,
 	type OrderStatus,
 	type SupportAgentSessionRecord,
+	type DeliveryAddressInput,
+	type DeliveryStatus,
 	type SupportTicketRecord,
 	type SupportTicketStatus,
 } from "./commerce";
@@ -149,6 +157,10 @@ interface AdminOrderStatusRequest {
 	reason?: string;
 	changed_by?: string;
 	changed_by_role?: string;
+}
+
+interface AdminOrderDeliveryStatusRequest {
+	status?: string;
 }
 
 interface AdminTicketStatusRequest {
@@ -273,6 +285,295 @@ async function sendWhatsAppMessage(
 		},
 		env
 	);
+}
+
+type DeliveryCollectionStep =
+	| "CHOICE"
+	| "RECIPIENT_NAME"
+	| "RECIPIENT_PHONE"
+	| "EMAIL"
+	| "ADDRESS_LINE_1"
+	| "ADDRESS_LINE_2"
+	| "CITY"
+	| "STATE"
+	| "PINCODE"
+	| "LANDMARK";
+
+const DELIVERY_STEP_PROMPTS: Record<Exclude<DeliveryCollectionStep, "CHOICE">, string> = {
+	RECIPIENT_NAME: "Please enter the recipient's name.",
+	RECIPIENT_PHONE: "Please enter the recipient's phone number, including country code.",
+	EMAIL: "Enter an email address, or reply SKIP if you do not want to provide one.",
+	ADDRESS_LINE_1: "Enter the delivery address (house or building and street).",
+	ADDRESS_LINE_2: "Enter an apartment or second address line, or reply SKIP.",
+	CITY: "Which city should we deliver to?",
+	STATE: "Which state should we deliver to?",
+	PINCODE: "Enter the 6-digit delivery pincode.",
+	LANDMARK: "Enter a nearby landmark, or reply SKIP.",
+};
+
+const DELIVERY_STEP_ORDER: readonly Exclude<DeliveryCollectionStep, "CHOICE">[] = [
+	"RECIPIENT_NAME",
+	"RECIPIENT_PHONE",
+	"EMAIL",
+	"ADDRESS_LINE_1",
+	"ADDRESS_LINE_2",
+	"CITY",
+	"STATE",
+	"PINCODE",
+	"LANDMARK",
+];
+
+async function sendDeliveryChoicePrompt(
+	to: string,
+	orderId: number,
+	totalAmount: number,
+	env: Env
+): Promise<void> {
+	await sendWhatsAppPayload(
+		{
+			messaging_product: "whatsapp",
+			recipient_type: "individual",
+			to,
+			type: "interactive",
+			interactive: {
+				type: "button",
+				body: {
+					text: [
+						"✅ Payment received!",
+						"",
+						`Order #${orderId} is confirmed. Amount paid: ₹${totalAmount}.`,
+						"",
+						"Would you like to add delivery details for this order?",
+					].join("\n"),
+				},
+				action: {
+					buttons: [
+						{ type: "reply", reply: { id: "DELIVERY_DETAILS_YES", title: "Yes" } },
+						{ type: "reply", reply: { id: "DELIVERY_DETAILS_NO", title: "No" } },
+					],
+				},
+			},
+		},
+		env
+	);
+}
+
+async function ensureDeliveryFollowUp(
+	orderId: number,
+	customerPhone: string,
+	env: Env
+): Promise<SupportTicketRecord> {
+	const client = getAdminClient(env);
+	const { data: existing, error: lookupError } = await client
+		.from("support_tickets")
+		.select("*")
+		.eq("order_id", orderId)
+		.eq("issue_type", "DELIVERY_DETAILS_PENDING")
+		.in("status", ["OPEN", "IN_PROGRESS", "WAITING_CUSTOMER", "WAITING_AGENT"])
+		.order("created_at", { ascending: false })
+		.limit(1)
+		.maybeSingle();
+
+	if (lookupError) {
+		throw new Error(`Delivery follow-up lookup failed: ${lookupError.message}`);
+	}
+	if (existing) {
+		return existing as SupportTicketRecord;
+	}
+
+	return createSupportTicket(
+		{
+			customerPhone,
+			orderId,
+			issueType: "DELIVERY_DETAILS_PENDING",
+			issueDescription: "Customer declined to enter delivery details after payment. Customer care must collect the recipient and delivery address.",
+			priority: "NORMAL",
+		},
+		env
+	);
+}
+
+function readDeliveryAddressDraft(value: unknown): Partial<DeliveryAddressInput> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return {};
+	}
+	return value as Partial<DeliveryAddressInput>;
+}
+
+async function sendDeliveryStepPrompt(
+	to: string,
+	step: DeliveryCollectionStep,
+	env: Env,
+	prefix?: string
+): Promise<void> {
+	if (step === "CHOICE") {
+		await sendWhatsAppMessage(to, prefix ?? "Please choose Yes or No to continue.", env);
+		return;
+	}
+	await sendWhatsAppMessage(
+		to,
+		[prefix, DELIVERY_STEP_PROMPTS[step]].filter(Boolean).join("\n\n"),
+		env
+	);
+}
+
+async function handleDeliveryConversation(
+	sender: string,
+	incomingText: string,
+	buttonId: string,
+	env: Env
+): Promise<boolean> {
+	const conversation = await getConversationState(sender, env);
+	if (!conversation || conversation.state !== "DELIVERY_DETAILS") {
+		return false;
+	}
+
+	const context = conversation.context ?? {};
+	const orderId = Number(context.order_id);
+	const step = context.step as DeliveryCollectionStep;
+	if (!Number.isSafeInteger(orderId) || orderId <= 0 || !(step in DELIVERY_STEP_PROMPTS || step === "CHOICE")) {
+		throw new Error(`Invalid persisted delivery conversation state for ${sender}`);
+	}
+
+	const delivery = readDeliveryAddressDraft(context.delivery);
+	const answer = incomingText.trim();
+	if (!answer && !buttonId) {
+		await sendDeliveryStepPrompt(sender, step, env);
+		return true;
+	}
+
+	if (step === "CHOICE") {
+		const choice = buttonId === "DELIVERY_DETAILS_YES" || /^(yes|y|yeah|yep)$/i.test(answer)
+			? "YES"
+			: buttonId === "DELIVERY_DETAILS_NO" || /^(no|n|nope)$/i.test(answer)
+				? "NO"
+				: null;
+
+		if (!choice) {
+			await sendDeliveryStepPrompt(sender, "CHOICE", env);
+			return true;
+		}
+
+		await setOrderDeliveryResponse(orderId, choice, env);
+		if (choice === "NO") {
+			const { data: order, error } = await getAdminClient(env)
+				.from("orders")
+				.select("customer_phone")
+				.eq("id", orderId)
+				.eq("customer_phone", sender)
+				.maybeSingle();
+			if (error || !order) {
+				throw new Error(`Delivery follow-up order lookup failed: ${error?.message ?? "Order not found for this customer"}`);
+			}
+
+			const ticket = await ensureDeliveryFollowUp(orderId, sender, env);
+			await upsertConversationState(sender, "MAIN_MENU", env, {}, answer || buttonId);
+			await sendWhatsAppMessage(
+				sender,
+				[
+					"Thank you. Our customer care team will contact you shortly to collect delivery details and schedule the delivery.",
+					"",
+					`Follow-up reference: ${ticket.ticket_number}`,
+				].join("\n"),
+				env
+			);
+			return true;
+		}
+
+		const firstStep = DELIVERY_STEP_ORDER[0];
+		await upsertConversationState(
+			sender,
+			"DELIVERY_DETAILS",
+			env,
+			{ source: "PAYMENT_SUCCESS_DELIVERY", order_id: orderId, step: firstStep, delivery },
+			answer || buttonId
+		);
+		await sendDeliveryStepPrompt(sender, firstStep, env);
+		return true;
+	}
+
+	const currentIndex = DELIVERY_STEP_ORDER.indexOf(step as Exclude<DeliveryCollectionStep, "CHOICE">);
+	if (currentIndex < 0) {
+		throw new Error(`Unsupported delivery collection step: ${String(step)}`);
+	}
+	const nextStep = DELIVERY_STEP_ORDER[currentIndex + 1];
+	const skip = /^(skip|none|no|n\/a)$/i.test(answer);
+	const nextDelivery: Partial<DeliveryAddressInput> = { ...delivery };
+	let fieldError: string | null = null;
+
+	switch (step) {
+		case "RECIPIENT_NAME":
+			if (!answer.trim() || answer.length > 100) fieldError = "Please enter a recipient name up to 100 characters.";
+			else nextDelivery.recipient_name = answer;
+			break;
+		case "RECIPIENT_PHONE": {
+			const phone = answer.replace(/\D/g, "");
+			if (phone.length < 8 || phone.length > 15) fieldError = "Enter a valid phone number containing 8 to 15 digits.";
+			else nextDelivery.recipient_phone = phone;
+			break;
+		}
+		case "EMAIL":
+			if (skip) nextDelivery.email = null;
+			else if (answer.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(answer)) fieldError = "Enter a valid email address, or reply SKIP.";
+			else nextDelivery.email = answer;
+			break;
+		case "ADDRESS_LINE_1":
+			if (!answer.trim() || answer.length > 500) fieldError = "Please enter an address up to 500 characters.";
+			else nextDelivery.address_line_1 = answer;
+			break;
+		case "ADDRESS_LINE_2":
+			if (!skip && answer.length > 500) fieldError = "The second address line must be 500 characters or fewer, or reply SKIP.";
+			else nextDelivery.address_line_2 = skip ? null : answer;
+			break;
+		case "CITY":
+			if (!answer.trim() || answer.length > 100) fieldError = "Please enter a city up to 100 characters.";
+			else nextDelivery.city = answer;
+			break;
+		case "STATE":
+			if (!answer.trim() || answer.length > 100) fieldError = "Please enter a state up to 100 characters.";
+			else nextDelivery.state = answer;
+			break;
+		case "PINCODE":
+			if (!/^\d{6}$/.test(answer)) fieldError = "Pincode must contain exactly 6 digits.";
+			else nextDelivery.pincode = answer;
+			break;
+		case "LANDMARK":
+			if (!skip && answer.length > 200) fieldError = "The landmark must be 200 characters or fewer, or reply SKIP.";
+			else nextDelivery.landmark = skip ? null : answer;
+			break;
+	}
+
+	if (fieldError) {
+		await sendDeliveryStepPrompt(sender, step, env, fieldError);
+		return true;
+	}
+
+	if (nextStep) {
+		await upsertConversationState(
+			sender,
+			"DELIVERY_DETAILS",
+			env,
+			{ source: "PAYMENT_SUCCESS_DELIVERY", order_id: orderId, step: nextStep, delivery: nextDelivery },
+			answer
+		);
+		await sendDeliveryStepPrompt(sender, nextStep, env);
+		return true;
+	}
+
+	const saved = await saveDeliveryAddressForOrder(orderId, sender, nextDelivery as DeliveryAddressInput, env);
+	await upsertConversationState(sender, "MAIN_MENU", env, {}, answer);
+	await sendWhatsAppMessage(
+		sender,
+		[
+			`✅ Delivery details saved for order #${orderId}.`,
+			`Recipient: ${saved.address.recipient_name}`,
+			`Delivery status: ${saved.delivery.delivery_status}.`,
+			"",
+			"You can add another delivery location with a future order.",
+		].join("\n"),
+		env
+	);
+	return true;
 }
 
 const CUSTOMER_NOTIFICATION_STATUSES: Record<string, string> = {
@@ -3549,6 +3850,17 @@ function getAdminStatusErrorResponse(error: unknown): Response {
 	return Response.json({ error: message }, { status });
 }
 
+function getAdminDeliveryStatusErrorResponse(error: unknown): Response {
+	const message = error instanceof Error ? error.message : "Admin delivery status update failed";
+	const status = message.includes("Delivery record not found")
+		? 404
+		: message.startsWith("Invalid delivery status transition")
+			? 409
+			: 500;
+
+	return Response.json({ error: message }, { status });
+}
+
 export default {
 	async fetch(
 		request: Request,
@@ -3667,6 +3979,55 @@ if (
 			} catch (error) {
 				console.error("Admin order status update failed:", error);
 				return getAdminStatusErrorResponse(error);
+			}
+		}
+
+		const adminDeliveryStatusMatch = url.pathname.match(
+			/^\/api\/admin\/orders\/(\d+)\/delivery-status$/
+		);
+		if (request.method === "POST" && adminDeliveryStatusMatch) {
+			if (!env.ADMIN_API_TOKEN) {
+				return Response.json(
+					{ error: "Admin API is not configured" },
+					{ status: 503 }
+				);
+			}
+			if (!isAdminRequest(request, env)) {
+				return Response.json({ error: "Unauthorized" }, { status: 401 });
+			}
+
+			const orderId = Number(adminDeliveryStatusMatch[1]);
+			let body: AdminOrderDeliveryStatusRequest;
+			try {
+				body = await request.json() as AdminOrderDeliveryStatusRequest;
+			} catch {
+				return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
+			}
+
+			const validStatuses: readonly DeliveryStatus[] = [
+				"PENDING_DETAILS",
+				"DETAILS_RECEIVED",
+				"READY_FOR_DELIVERY",
+				"OUT_FOR_DELIVERY",
+				"DELIVERED",
+			];
+			if (!body.status || !validStatuses.includes(body.status as DeliveryStatus)) {
+				return Response.json(
+					{ error: "A valid delivery status is required" },
+					{ status: 400 }
+				);
+			}
+
+			try {
+				const delivery = await updateOrderDeliveryStatus(
+					orderId,
+					body.status as DeliveryStatus,
+					env
+				);
+				return Response.json({ delivery });
+			} catch (error) {
+				console.error("Admin delivery status update failed:", error);
+				return getAdminDeliveryStatusErrorResponse(error);
 			}
 		}
 
@@ -4251,18 +4612,65 @@ if (
 			console.log("[RETURN] POST /razorpay-webhook delegated", result);
 
 			if (result.ok && result.orderId && result.customerPhone) {
-				await sendWhatsAppMessage(
-					result.customerPhone,
-					[
-						"✅ Payment received!",
-						"",
-						`Order #${result.orderId} is confirmed.`,
-						`Amount paid: ₹${result.totalAmount}`,
-						"",
-						"We'll notify you once it ships.",
-					].join("\n"),
-					env
-				);
+				const delivery = await ensurePendingOrderDelivery(result.orderId, env);
+				if (delivery.delivery_status === "PENDING_DETAILS") {
+					if (delivery.customer_response === "NO") {
+						await ensureDeliveryFollowUp(result.orderId, result.customerPhone, env);
+					} else {
+						const conversation = await getConversationState(result.customerPhone, env);
+						const context = conversation?.context ?? {};
+						const activeOrderId = Number(context.order_id);
+						const isSameDeliveryConversation =
+							conversation?.state === "DELIVERY_DETAILS" &&
+							activeOrderId === result.orderId;
+
+						if (!isSameDeliveryConversation) {
+							if (
+								conversation?.state === "DELIVERY_DETAILS" &&
+								Number.isSafeInteger(activeOrderId) &&
+								activeOrderId > 0
+							) {
+								const interruptedDelivery = await getOrderDeliveryDetails(activeOrderId, env);
+								if (interruptedDelivery?.delivery_status === "PENDING_DETAILS") {
+									await ensureDeliveryFollowUp(activeOrderId, result.customerPhone, env);
+								}
+							}
+							const step = delivery.customer_response === "YES"
+								? "RECIPIENT_NAME"
+								: "CHOICE";
+							await upsertConversationState(
+								result.customerPhone,
+								"DELIVERY_DETAILS",
+								env,
+								{ source: "PAYMENT_SUCCESS_DELIVERY", order_id: result.orderId, step, delivery: {} },
+								"payment_link.paid"
+							);
+							if (step === "CHOICE") {
+								await sendDeliveryChoicePrompt(
+									result.customerPhone,
+									result.orderId,
+									result.totalAmount ?? 0,
+									env
+								);
+							} else {
+								await sendDeliveryStepPrompt(result.customerPhone, "RECIPIENT_NAME", env);
+							}
+						} else if (context.step === "CHOICE") {
+							await sendDeliveryChoicePrompt(
+								result.customerPhone,
+								result.orderId,
+								result.totalAmount ?? 0,
+								env
+							);
+						}
+					}
+				} else if (!result.alreadyPaid) {
+					await sendWhatsAppMessage(
+						result.customerPhone,
+						`✅ Payment received! Order #${result.orderId} is confirmed. Delivery details are already on file.`,
+						env
+					);
+				}
 			}
 
 			return new Response(result.ok ? "Payment processed" : "Payment not processed", { status: result.ok ? 200 : 400 });
@@ -4329,10 +4737,8 @@ if (
 					crypto.randomUUID()
 				);
 
-			const incomingText =
-				message.text?.body
-					?.trim()
-					.toLowerCase() ?? "";
+			const incomingTextRaw = message.text?.body?.trim() ?? "";
+			const incomingText = incomingTextRaw.toLowerCase();
 
 			const buttonId =
 				message.interactive
@@ -4357,6 +4763,11 @@ if (
 			ctx.waitUntil(
 				(async () => {
 					try {
+						if (await handleDeliveryConversation(sender, incomingTextRaw, buttonId, env)) {
+							console.log("[WEBHOOK BRANCH RETURN] Delivery details conversation");
+							return;
+						}
+
 						if (message.text?.body && await processWaitingAgentCustomerMessage(sender, incomingText, env)) {
 							console.log("[WEBHOOK BRANCH RETURN] Waiting-agent customer message");
 							return;

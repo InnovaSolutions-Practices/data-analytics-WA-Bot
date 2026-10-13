@@ -23,7 +23,8 @@ export type ConversationState =
 	| 'VIEWING_CART'
 	| 'CHECKOUT'
 	| 'TRACK_ORDER'
-	| 'CUSTOMER_CARE';
+	| 'CUSTOMER_CARE'
+	| 'DELIVERY_DETAILS';
 
 export const CONVERSATION_STATES: ConversationState[] = [
 	'MAIN_MENU',
@@ -32,6 +33,7 @@ export const CONVERSATION_STATES: ConversationState[] = [
 	'CHECKOUT',
 	'TRACK_ORDER',
 	'CUSTOMER_CARE',
+	'DELIVERY_DETAILS',
 ];
 
 const EMBEDDING_MODEL = 'text-embedding-3-small';
@@ -73,6 +75,10 @@ export function resolveConversationState(value: string): ConversationState {
 
 	if (normalized === 'CHECKOUT') {
 		return 'CHECKOUT';
+	}
+
+	if (normalized === 'DELIVERY_DETAILS') {
+		return 'DELIVERY_DETAILS';
 	}
 
 	if (normalized === 'MAIN_MENU' || normalized === 'MAINMENU') {

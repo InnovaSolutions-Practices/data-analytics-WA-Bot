@@ -440,6 +440,105 @@ export interface ConversationStateRecord {
   updated_at: string;
 }
 
+export type DeliveryStatus =
+  | 'PENDING_DETAILS'
+  | 'DETAILS_RECEIVED'
+  | 'READY_FOR_DELIVERY'
+  | 'OUT_FOR_DELIVERY'
+  | 'DELIVERED';
+
+export type DeliveryCustomerResponse = 'AWAITING' | 'YES' | 'NO';
+
+export interface DeliveryAddressRecord {
+  id: number;
+  customer_id: number;
+  recipient_name: string;
+  recipient_phone: string;
+  email: string | null;
+  address_line_1: string;
+  address_line_2: string | null;
+  city: string;
+  state: string;
+  pincode: string;
+  landmark: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DeliveryAddressInput {
+  recipient_name: string;
+  recipient_phone: string;
+  email?: string | null;
+  address_line_1: string;
+  address_line_2?: string | null;
+  city: string;
+  state: string;
+  pincode: string;
+  landmark?: string | null;
+}
+
+export interface OrderDeliveryDetailsRecord {
+  id: number;
+  order_id: number;
+  delivery_address_id: number | null;
+  customer_response: DeliveryCustomerResponse;
+  delivery_status: DeliveryStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export function validateDeliveryAddress(input: DeliveryAddressInput): DeliveryAddressInput {
+  const requiredText = (
+    value: string,
+    field: string,
+    maxLength: number
+  ): string => {
+    const normalized = value.trim();
+    if (!normalized) {
+      throw new Error(`${field} is required`);
+    }
+    if (normalized.length > maxLength) {
+      throw new Error(`${field} must be ${maxLength} characters or fewer`);
+    }
+    return normalized;
+  };
+
+  const recipientPhone = input.recipient_phone.replace(/\D/g, '');
+  if (recipientPhone.length < 8 || recipientPhone.length > 15) {
+    throw new Error('Recipient phone number must contain 8 to 15 digits');
+  }
+
+  const email = input.email?.trim() || null;
+  if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) {
+    throw new Error('Enter a valid email address or reply SKIP');
+  }
+
+  const pincode = input.pincode.trim();
+  if (!/^\d{6}$/.test(pincode)) {
+    throw new Error('Pincode must contain exactly 6 digits');
+  }
+
+  const optionalText = (value: string | null | undefined, maxLength: number): string | null => {
+    const normalized = value?.trim() ?? '';
+    if (normalized.length > maxLength) {
+      throw new Error(`Optional address field must be ${maxLength} characters or fewer`);
+    }
+    return normalized || null;
+  };
+
+  return {
+    recipient_name: requiredText(input.recipient_name, 'Recipient name', 100),
+    recipient_phone: recipientPhone,
+    email,
+    address_line_1: requiredText(input.address_line_1, 'Address', 500),
+    address_line_2: optionalText(input.address_line_2, 500),
+    city: requiredText(input.city, 'City', 100),
+    state: requiredText(input.state, 'State', 100),
+    pincode,
+    landmark: optionalText(input.landmark, 200),
+  };
+}
+
 export interface CommerceEnv extends RAGEnv {
   RAZORPAY_KEY_ID: string;
   RAZORPAY_KEY_SECRET: string;
@@ -1089,6 +1188,290 @@ export async function upsertCustomer(
   return data as CustomerRecord;
 }
 
+export async function ensurePendingOrderDelivery(
+  orderId: number,
+  env: RAGEnv
+): Promise<OrderDeliveryDetailsRecord> {
+  const client = getAdminClient(env);
+  const { data, error } = await client
+    .from('order_delivery_details')
+    .upsert(
+      { order_id: orderId, delivery_status: 'PENDING_DETAILS' },
+      { onConflict: 'order_id', ignoreDuplicates: true }
+    )
+    .select('*')
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Pending delivery creation failed: ${error.message}`);
+  }
+
+  if (data) {
+    return data as OrderDeliveryDetailsRecord;
+  }
+
+  const { data: existing, error: lookupError } = await client
+    .from('order_delivery_details')
+    .select('*')
+    .eq('order_id', orderId)
+    .maybeSingle();
+
+  if (lookupError || !existing) {
+    throw new Error(`Pending delivery lookup failed: ${lookupError?.message ?? 'Delivery record not found after upsert'}`);
+  }
+
+  return existing as OrderDeliveryDetailsRecord;
+}
+
+export async function getOrderDeliveryDetails(
+  orderId: number,
+  env: RAGEnv
+): Promise<OrderDeliveryDetailsRecord | null> {
+  const { data, error } = await getAdminClient(env)
+    .from('order_delivery_details')
+    .select('*')
+    .eq('order_id', orderId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Order delivery lookup failed: ${error.message}`);
+  }
+
+  return (data as OrderDeliveryDetailsRecord | null) ?? null;
+}
+
+export async function setOrderDeliveryResponse(
+  orderId: number,
+  response: Exclude<DeliveryCustomerResponse, 'AWAITING'>,
+  env: RAGEnv
+): Promise<OrderDeliveryDetailsRecord> {
+  const client = getAdminClient(env);
+  const { data, error } = await client
+    .from('order_delivery_details')
+    .update({ customer_response: response })
+    .eq('order_id', orderId)
+    .eq('customer_response', 'AWAITING')
+    .select('*')
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Delivery response update failed: ${error.message}`);
+  }
+
+  if (data) {
+    return data as OrderDeliveryDetailsRecord;
+  }
+
+  const existing = await getOrderDeliveryDetails(orderId, env);
+  if (!existing || existing.customer_response !== response) {
+    throw new Error('Delivery response conflicts with the saved customer choice');
+  }
+
+  return existing;
+}
+
+export async function getConversationState(
+  whatsappNumber: string,
+  env: RAGEnv
+): Promise<ConversationStateRecord | null> {
+  const { data, error } = await getAdminClient(env)
+    .from('conversation_state')
+    .select('*')
+    .eq('whatsapp_number', whatsappNumber)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Conversation state lookup failed: ${error.message}`);
+  }
+
+  return (data as ConversationStateRecord | null) ?? null;
+}
+
+export async function saveDeliveryAddressForOrder(
+  orderId: number,
+  customerPhone: string,
+  input: DeliveryAddressInput,
+  env: RAGEnv
+): Promise<{ address: DeliveryAddressRecord; delivery: OrderDeliveryDetailsRecord }> {
+  const addressInput = validateDeliveryAddress(input);
+  const client = getAdminClient(env);
+  const { data: order, error: orderError } = await client
+    .from('orders')
+    .select('id, customer_id, customer_phone')
+    .eq('id', orderId)
+    .eq('customer_phone', customerPhone)
+    .maybeSingle();
+
+  if (orderError || !order) {
+    throw new Error(`Delivery order lookup failed: ${orderError?.message ?? 'Order not found for this customer'}`);
+  }
+
+  const currentDelivery = await getOrderDeliveryDetails(orderId, env);
+  if (!currentDelivery) {
+    throw new Error('Delivery details were not initialized for this order');
+  }
+
+  if (currentDelivery.delivery_address_id !== null) {
+    const { data: existingAddress, error: addressError } = await client
+      .from('delivery_addresses')
+      .select('*')
+      .eq('id', currentDelivery.delivery_address_id)
+      .single();
+    if (addressError || !existingAddress) {
+      throw new Error(`Saved delivery address lookup failed: ${addressError?.message ?? 'Address not found'}`);
+    }
+    return {
+      address: existingAddress as DeliveryAddressRecord,
+      delivery: currentDelivery,
+    };
+  }
+
+  if (currentDelivery.delivery_status !== 'PENDING_DETAILS') {
+    throw new Error(`Delivery details cannot be changed from status ${currentDelivery.delivery_status}`);
+  }
+
+  let customerId = order.customer_id as number | null;
+  if (customerId === null) {
+    const customer = await upsertCustomer(String(order.customer_phone), env);
+    customerId = customer.id;
+    const { error: customerLinkError } = await client
+      .from('orders')
+      .update({ customer_id: customerId })
+      .eq('id', orderId)
+      .is('customer_id', null);
+    if (customerLinkError) {
+      throw new Error(`Order customer link update failed: ${customerLinkError.message}`);
+    }
+  }
+
+  const { data: address, error: addressError } = await client
+    .from('delivery_addresses')
+    .insert({ ...addressInput, customer_id: customerId })
+    .select('*')
+    .single();
+
+  if (addressError || !address) {
+    throw new Error(`Delivery address creation failed: ${addressError?.message ?? 'Unknown error'}`);
+  }
+
+  const { data: delivery, error: deliveryError } = await client
+    .from('order_delivery_details')
+    .update({
+      delivery_address_id: address.id,
+      delivery_status: 'DETAILS_RECEIVED',
+    })
+    .eq('order_id', orderId)
+    .eq('delivery_status', 'PENDING_DETAILS')
+    .is('delivery_address_id', null)
+    .select('*')
+    .maybeSingle();
+
+  if (deliveryError) {
+    throw new Error(`Order delivery update failed: ${deliveryError.message}`);
+  }
+
+  if (delivery) {
+    return {
+      address: address as DeliveryAddressRecord,
+      delivery: delivery as OrderDeliveryDetailsRecord,
+    };
+  }
+
+  const { error: cleanupError } = await client
+    .from('delivery_addresses')
+    .delete()
+    .eq('id', address.id);
+  if (cleanupError) {
+    throw new Error(`Concurrent delivery update succeeded, but unused address cleanup failed: ${cleanupError.message}`);
+  }
+
+  const completedDelivery = await getOrderDeliveryDetails(orderId, env);
+  if (!completedDelivery?.delivery_address_id) {
+    throw new Error('Order delivery details changed before the address could be linked');
+  }
+
+  const { data: linkedAddress, error: linkedAddressError } = await client
+    .from('delivery_addresses')
+    .select('*')
+    .eq('id', completedDelivery.delivery_address_id)
+    .single();
+  if (linkedAddressError || !linkedAddress) {
+    throw new Error(`Concurrent delivery address lookup failed: ${linkedAddressError?.message ?? 'Address not found'}`);
+  }
+
+  return {
+    address: linkedAddress as DeliveryAddressRecord,
+    delivery: completedDelivery,
+  };
+}
+
+export async function getCustomerDeliveryAddresses(
+  customerId: number,
+  env: RAGEnv
+): Promise<DeliveryAddressRecord[]> {
+  const { data, error } = await getAdminClient(env)
+    .from('delivery_addresses')
+    .select('*')
+    .eq('customer_id', customerId)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    throw new Error(`Customer delivery addresses lookup failed: ${error.message}`);
+  }
+
+  return (data as DeliveryAddressRecord[]) ?? [];
+}
+
+const DELIVERY_STATUS_TRANSITIONS: Record<DeliveryStatus, readonly DeliveryStatus[]> = {
+  PENDING_DETAILS: ['DETAILS_RECEIVED'],
+  DETAILS_RECEIVED: ['READY_FOR_DELIVERY'],
+  READY_FOR_DELIVERY: ['OUT_FOR_DELIVERY'],
+  OUT_FOR_DELIVERY: ['DELIVERED'],
+  DELIVERED: [],
+};
+
+export async function updateOrderDeliveryStatus(
+  orderId: number,
+  nextStatus: DeliveryStatus,
+  env: RAGEnv
+): Promise<OrderDeliveryDetailsRecord> {
+  const client = getAdminClient(env);
+  const { data: current, error: lookupError } = await client
+    .from('order_delivery_details')
+    .select('*')
+    .eq('order_id', orderId)
+    .maybeSingle();
+
+  if (lookupError || !current) {
+    throw new Error(`Order delivery status lookup failed: ${lookupError?.message ?? 'Delivery record not found'}`);
+  }
+
+  const currentStatus = current.delivery_status as DeliveryStatus;
+  if (currentStatus === nextStatus) {
+    return current as OrderDeliveryDetailsRecord;
+  }
+  if (!DELIVERY_STATUS_TRANSITIONS[currentStatus]?.includes(nextStatus)) {
+    throw new Error(`Invalid delivery status transition: ${currentStatus} -> ${nextStatus}`);
+  }
+
+  const { data: updated, error: updateError } = await client
+    .from('order_delivery_details')
+    .update({ delivery_status: nextStatus })
+    .eq('id', current.id)
+    .eq('delivery_status', currentStatus)
+    .select('*')
+    .maybeSingle();
+
+  if (updateError) {
+    throw new Error(`Order delivery status update failed: ${updateError.message}`);
+  }
+  if (!updated) {
+    throw new Error('Order delivery status update conflicted with another change');
+  }
+
+  return updated as OrderDeliveryDetailsRecord;
+}
+
 export async function getActiveCart(
   whatsappNumber: string,
   env: RAGEnv
@@ -1727,7 +2110,7 @@ export async function handleRazorpaySuccessWebhook(
   rawBody: string,
   signature: string,
   env: CommerceEnv
-): Promise<{ ok: boolean; orderId?: number; customerPhone?: string; totalAmount?: number }> {
+): Promise<{ ok: boolean; orderId?: number; customerPhone?: string; totalAmount?: number; alreadyPaid?: boolean }> {
   const expectedSignature = await createRazorpaySignature(rawBody, env.RAZORPAY_WEBHOOK_SECRET);
   const isValid = safeCompare(expectedSignature, signature.toLowerCase());
   if (!isValid) {
@@ -1795,6 +2178,7 @@ export async function handleRazorpaySuccessWebhook(
       orderId: Number(order.id),
       customerPhone: order.customer_phone,
       totalAmount: Number(order.total_amount),
+      alreadyPaid: true,
     };
   }
 
@@ -1848,5 +2232,6 @@ export async function handleRazorpaySuccessWebhook(
     orderId: Number(order.id),
     customerPhone: order.customer_phone,
     totalAmount: Number(order.total_amount),
+    alreadyPaid: false,
   };
 }
