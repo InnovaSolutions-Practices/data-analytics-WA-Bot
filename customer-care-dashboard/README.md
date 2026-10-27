@@ -39,13 +39,13 @@ The Customer Care Dashboard provides a centralized interface for customer suppor
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/alluru-lekhana/customer-care-dashboard.git
+   git clone -b development https://github.com/InnovaSolutions-Practices/data-analytics-WA-Bot.git
    ```
 
 2. Navigate to the project directory:
 
    ```bash
-   cd customer-care-dashboard
+  cd data-analytics-WA-Bot/customer-care-dashboard
    ```
 
 3. Install dependencies:
