@@ -1,20 +1,21 @@
 # Customer Care Dashboard
 
-A React-based customer care dashboard designed to help support teams access customer information and manage customer-related operations.
+A React-based customer care dashboard designed to help support teams access customer information and manage customer-related operations. The dashboard integrates with the WhatsApp Bot backend through APIs.
 
 ## Overview
 
-The Customer Care Dashboard provides a centralized interface for customer support teams to view customer records and access customer details. It integrates with the WhatsApp Bot backend to retrieve customer information through APIs.
+The Customer Care Dashboard provides a centralized interface for customer support teams to view customer records and access customer details.
 
 ## Features
 
 - **Customer Management:** View customer records retrieved from the backend API.
 - **Customer Search:** Search and filter customer records.
-- **Customer Details:** Dedicated interface for viewing individual customer information.
+- **Customer Details:** View individual customer information.
 - **API Integration:** Fetch customer data from the WhatsApp Bot backend.
-- **Responsive Interface:** Dashboard layout built with React.
+- **Order and Tracking Management:** Dashboard pages for order-related operations and tracking.
+- **Responsive Interface:** React-based dashboard layout.
 
-*Note: Customer details and order history integration are still being developed.*
+*Note: Feature availability depends on the current backend integration and implementation status.*
 
 ## Tech Stack
 
@@ -36,16 +37,16 @@ The Customer Care Dashboard provides a centralized interface for customer suppor
 
 ### Installation
 
-1. Clone the repository:
+1. Clone the WA Bot repository and switch to the `development` branch:
 
    ```bash
    git clone -b development https://github.com/InnovaSolutions-Practices/data-analytics-WA-Bot.git
    ```
 
-2. Navigate to the project directory:
+2. Navigate to the dashboard directory:
 
    ```bash
-  cd data-analytics-WA-Bot/customer-care-dashboard
+   cd data-analytics-WA-Bot/customer-care-dashboard
    ```
 
 3. Install dependencies:
@@ -60,23 +61,23 @@ The Customer Care Dashboard provides a centralized interface for customer suppor
    npm run dev
    ```
 
-5. Open the local URL shown in your terminal.
+5. Open the local URL displayed in your terminal.
 
 ## Backend API
 
 The dashboard connects to the WhatsApp Bot backend to retrieve customer information.
 
-The customer API requires authorization. Configure authentication securely before running the application. Do not commit private tokens, API keys, or other credentials to the repository.
+The customer API requires authorization. Configure authentication securely before running the application. Never commit private tokens, API keys, or other credentials to the repository.
 
 ## Project Status
 
 **In Development**
 
-Customer listing and backend integration are in progress. Customer details and related functionality are being developed.
+Dashboard features and backend integration may continue to evolve.
 
 ## Team Collaboration
 
-This repository is maintained for the Customer Care Dashboard project. Access is managed through GitHub collaborators.
+The dashboard is maintained within the WA Bot repository. Repository access and collaboration are managed through GitHub.
 
 ## License
 
