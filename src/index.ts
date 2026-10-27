@@ -3861,18 +3861,20 @@ function getAdminDeliveryStatusErrorResponse(error: unknown): Response {
 	return Response.json({ error: message }, { status });
 }
 
-export default {
-	async fetch(
-		request: Request,
-		env: Env,
-		ctx: ExecutionContext
-	): Promise<Response> {
-		const url = new URL(request.url);
-		console.log(
-			"[REQUEST]",
-			request.method,
-			url.pathname
-		);
+
+async function handleRequest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<Response> {
+  const url = new URL(request.url);
+
+  console.log(
+    "[REQUEST]",
+    request.method,
+    url.pathname
+  );
+
 
 		if (request.method === "GET" && url.pathname === "/message") {
 			console.log("[RETURN] GET /message 200");
@@ -3913,6 +3915,635 @@ if (
 		answer,
 	});
 }
+
+		/*
+		|--------------------------------------------------------------------------
+		| Admin orders API
+		|--------------------------------------------------------------------------
+		*/
+
+		if (request.method === "GET" && url.pathname === "/api/admin/orders") {
+			if (!env.ADMIN_API_TOKEN) {
+				return Response.json(
+					{ error: "Admin API is not configured" },
+					{ status: 503 }
+				);
+			}
+
+			if (!isAdminRequest(request, env)) {
+				return Response.json({ error: "Unauthorized" }, { status: 401 });
+			}
+
+			try {
+				const orders: Order[] = [];
+				const pageSize = 1000;
+				let from = 0;
+				let page: Order[];
+
+				do {
+					const { data, error } = await getAdminClient(env)
+						.from("orders")
+						.select("*")
+						.order("created_at", { ascending: false })
+						.range(from, from + pageSize - 1);
+
+					if (error) {
+						throw new Error(error.message);
+					}
+
+					page = (data ?? []) as Order[];
+					orders.push(...page);
+					from += pageSize;
+				} while (page.length === pageSize);
+
+				return Response.json({
+					success: true,
+					count: orders.length,
+					orders,
+				});
+			} catch (error) {
+				console.error("Admin order list failed:", error);
+				return Response.json(
+					{ success: false, error: "Could not load orders" },
+					{ status: 500 }
+				);
+			}
+		}
+		
+if (
+  request.method === "GET" &&
+  url.pathname === "/api/admin/customers"
+) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const { data, error } = await getAdminClient(env)
+      .from("customers")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) throw new Error(error.message);
+	
+const { data: orders, error: ordersError } = await getAdminClient(env)
+  .from("orders")
+  .select("id, customer_id, created_at");
+
+if (ordersError) throw new Error(ordersError.message);
+const customersWithOrderStats = (data ?? []).map((customer) => {
+  const customerOrders = (orders ?? []).filter(
+    (order) => String(order.customer_id) === String(customer.id)
+  );
+
+  const latestOrder = customerOrders.reduce<
+    (typeof customerOrders)[number] | null
+  >((latest, order) => {
+    if (!latest) return order;
+
+    return new Date(order.created_at).getTime() >
+      new Date(latest.created_at).getTime()
+      ? order
+      : latest;
+  }, null);
+
+  return {
+    ...customer,
+    total_orders: customerOrders.length,
+    last_order: latestOrder?.created_at ?? null,
+  };
+});
+
+    return Response.json({
+  success: true,
+  count: customersWithOrderStats.length,
+  customers: customersWithOrderStats,
+});
+  } catch (error) {
+    console.error("Admin customer list failed:", error);
+
+    return Response.json(
+      { success: false, error: "Could not load customers" },
+      { status: 500 }
+    );
+  }
+}
+
+
+
+/*
+|--------------------------------------------------------------------------
+| Admin customer details API
+|--------------------------------------------------------------------------
+*/
+
+
+const customerDetailsMatch = url.pathname.match(
+  /^\/api\/admin\/customers\/([^/]+)$/
+);
+
+if (
+  (request.method === "GET" || request.method === "PATCH") &&
+  customerDetailsMatch
+) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const customerId = customerDetailsMatch[1];
+    const supabase = getAdminClient(env);
+
+    if (request.method === "GET") {
+      const { data, error } = await supabase
+        .from("customers")
+        .select("*")
+        .eq("id", customerId)
+        .maybeSingle();
+
+      if (error) throw new Error(error.message);
+
+      if (!data) {
+        return Response.json(
+          { error: "Customer not found" },
+          { status: 404 }
+        );
+      }
+
+      return Response.json({
+        success: true,
+        customer: data,
+      });
+    }
+
+    const updates = await request.json();
+
+    // Only allow fields that the Edit Customer form updates.
+    const allowedFields = ["name", "email", "phone"];
+    const safeUpdates: Record<string, unknown> = {};
+
+    for (const field of allowedFields) {
+      if (Object.prototype.hasOwnProperty.call(updates, field)) {
+        safeUpdates[field] = updates[field];
+      }
+    }
+
+    if (Object.keys(safeUpdates).length === 0) {
+      return Response.json(
+        { error: "No valid customer fields provided" },
+        { status: 400 }
+      );
+    }
+
+    const { data, error } = await supabase
+      .from("customers")
+      .update(safeUpdates)
+      .eq("id", customerId)
+      .select("*")
+      .maybeSingle();
+
+    if (error) throw new Error(error.message);
+
+    if (!data) {
+      return Response.json(
+        { error: "Customer not found" },
+        { status: 404 }
+      );
+    }
+
+    return Response.json({
+      success: true,
+      customer: data,
+    });
+  } catch (error) {
+    console.error("Admin customer details failed:", error);
+
+    return Response.json(
+      {
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : "Could not process customer request",
+      },
+      { status: 500 }
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Admin carts API
+|--------------------------------------------------------------------------
+*/
+
+if (
+  request.method === "GET" &&
+  url.pathname === "/api/admin/carts"
+) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const supabase = getAdminClient(env);
+
+    // Fetch carts, newest first.
+    const { data: carts, error: cartsError } = await supabase
+      .from("carts")
+      .select("*")
+      .order("updated_at", { ascending: false });
+
+    if (cartsError) throw new Error(cartsError.message);
+
+    // Fetch all cart items.
+    const { data: items, error: itemsError } = await supabase
+      .from("cart_items")
+      .select("*");
+
+    if (itemsError) throw new Error(itemsError.message);
+
+    // Attach each cart's products to the matching cart.
+    const cartsWithItems = (carts ?? []).map((cart) => ({
+      ...cart,
+      items: (items ?? []).filter(
+        (item) => String(item.cart_id) === String(cart.id)
+      ),
+    }));
+
+    return Response.json({
+      success: true,
+      count: cartsWithItems.length,
+      carts: cartsWithItems,
+    });
+  } catch (error) {
+    console.error("Admin cart list failed:", error);
+
+    return Response.json(
+      { success: false, error: "Could not load carts" },
+      { status: 500 }
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Admin products API
+|--------------------------------------------------------------------------
+*/
+
+if (
+  request.method === "GET" &&
+  url.pathname === "/api/admin/products"
+) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const supabase = getAdminClient(env);
+
+    const { data: products, error } = await supabase
+      .from("products")
+      .select("id, created_at, name, price, description, stock, is_active")
+      .order("created_at", { ascending: false });
+
+    if (error) throw new Error(error.message);
+
+    return Response.json({
+      success: true,
+      count: products?.length ?? 0,
+      products: products ?? [],
+    });
+  } catch (error) {
+    console.error("Admin products list failed:", error);
+
+    return Response.json(
+      { success: false, error: "Could not load products" },
+      { status: 500 }
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Admin update product API
+|--------------------------------------------------------------------------
+*/
+
+const productUpdateMatch = url.pathname.match(
+  /^\/api\/admin\/products\/(\d+)$/
+);
+
+if (
+  request.method === "PATCH" &&
+  productUpdateMatch
+) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const productId = Number(productUpdateMatch[1]);
+    const body: unknown = await request.json();
+
+    if (
+      typeof body !== "object" ||
+      body === null ||
+      Array.isArray(body)
+    ) {
+      return Response.json(
+        { error: "Invalid request body" },
+        { status: 400 }
+      );
+    }
+
+    const input = body as Record<string, unknown>;
+    const allowedFields = [
+      "name",
+      "price",
+      "description",
+      "stock",
+      "is_active",
+    ];
+
+    const updates: Record<string, unknown> = {};
+
+    for (const key of Object.keys(input)) {
+      if (!allowedFields.includes(key)) {
+        return Response.json(
+          { error: `Field not allowed: ${key}` },
+          { status: 400 }
+        );
+      }
+
+      updates[key] = input[key];
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return Response.json(
+        { error: "No fields to update" },
+        { status: 400 }
+      );
+    }
+
+    if (
+      "name" in updates &&
+      (typeof updates.name !== "string" ||
+        !updates.name.trim())
+    ) {
+      return Response.json(
+        { error: "Product name is required" },
+        { status: 400 }
+      );
+    }
+
+    if (
+      "price" in updates &&
+      (typeof updates.price !== "number" ||
+        !Number.isFinite(updates.price) ||
+        updates.price < 0)
+    ) {
+      return Response.json(
+        { error: "Price must be a non-negative number" },
+        { status: 400 }
+      );
+    }
+
+    if (
+      "stock" in updates &&
+      (!Number.isInteger(updates.stock) ||
+        (updates.stock as number) < 0)
+    ) {
+      return Response.json(
+        { error: "Stock must be a non-negative integer" },
+        { status: 400 }
+      );
+    }
+
+    if (
+      "description" in updates &&
+      typeof updates.description !== "string"
+    ) {
+      return Response.json(
+        { error: "Description must be text" },
+        { status: 400 }
+      );
+    }
+
+    if (
+      "is_active" in updates &&
+      typeof updates.is_active !== "boolean"
+    ) {
+      return Response.json(
+        { error: "is_active must be true or false" },
+        { status: 400 }
+      );
+    }
+
+    if ("name" in updates) {
+      updates.name = (updates.name as string).trim();
+    }
+
+    const supabase = getAdminClient(env);
+
+    const { data: product, error } = await supabase
+      .from("products")
+      .update(updates)
+      .eq("id", productId)
+      .select(
+        "id, created_at, name, price, description, stock, is_active"
+      )
+      .maybeSingle();
+
+    if (error) throw new Error(error.message);
+
+    if (!product) {
+      return Response.json(
+        { error: "Product not found" },
+        { status: 404 }
+      );
+    }
+
+    return Response.json({
+      success: true,
+      product,
+    });
+  } catch (error) {
+    console.error("Admin product update failed:", error);
+
+    return Response.json(
+      { success: false, error: "Could not update product" },
+      { status: 500 }
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Admin conversations API
+|--------------------------------------------------------------------------
+*/
+
+if (
+  request.method === "GET" &&
+  url.pathname === "/api/admin/conversations"
+) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const supabase = getAdminClient(env);
+
+    const [
+      { data: contexts, error: contextsError },
+      { data: states, error: statesError },
+    ] = await Promise.all([
+      supabase
+        .from("conversation_context")
+        .select("phone_number, last_product, last_order_id, last_intent, updated_at")
+        .order("updated_at", { ascending: false })
+        .limit(500),
+
+      supabase
+        .from("conversation_state")
+        .select("id, whatsapp_number, state, context, last_message, created_at, updated_at")
+        .order("updated_at", { ascending: false })
+        .limit(500),
+    ]);
+
+    if (contextsError) throw new Error(contextsError.message);
+    if (statesError) throw new Error(statesError.message);
+
+    return Response.json({
+      success: true,
+      contexts: contexts ?? [],
+      states: states ?? [],
+    });
+  } catch (error) {
+    console.error("Admin conversations list failed:", error);
+
+    return Response.json(
+      { success: false, error: "Could not load conversations" },
+      { status: 500 }
+    );
+  }
+}
+
+
+
+/*
+|--------------------------------------------------------------------------
+| Admin customer orders API
+|--------------------------------------------------------------------------
+*/
+
+const customerOrdersMatch = url.pathname.match(
+  /^\/api\/admin\/customers\/([^/]+)\/orders$/
+);
+
+if (request.method === "GET" && customerOrdersMatch) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const customerId = customerOrdersMatch[1];
+
+    const { data, error } = await getAdminClient(env)
+      .from("orders")
+      .select("*")
+      .eq("customer_id", customerId)
+      .order("created_at", { ascending: false });
+
+    if (error) throw new Error(error.message);
+
+    return Response.json({
+      success: true,
+      count: data?.length ?? 0,
+      orders: data ?? [],
+    });
+  } catch (error) {
+    console.error("Admin customer orders failed:", error);
+
+    return Response.json(
+      { success: false, error: "Could not load customer orders" },
+      { status: 500 }
+    );
+  }
+}
+
 
 		/*
 		|--------------------------------------------------------------------------
@@ -4030,6 +4661,327 @@ if (
 				return getAdminDeliveryStatusErrorResponse(error);
 			}
 		}
+		
+/*
+|--------------------------------------------------------------------------
+| Admin customer delivery addresses API
+|--------------------------------------------------------------------------
+*/
+
+const customerAddressesMatch = url.pathname.match(
+  /^\/api\/admin\/customers\/([^/]+)\/addresses$/
+);
+
+if (request.method === "GET" && customerAddressesMatch) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const customerId = customerAddressesMatch[1];
+
+    const { data, error } = await getAdminClient(env)
+      .from("delivery_addresses")
+      .select("*")
+      .eq("customer_id", customerId)
+      .eq("is_active", true)
+      .order("is_default", { ascending: false })
+      .order("created_at", { ascending: false });
+
+    if (error) throw new Error(error.message);
+
+    return Response.json({
+      success: true,
+      count: data?.length ?? 0,
+      addresses: data ?? [],
+    });
+  } catch (error) {
+    console.error("Admin customer addresses failed:", error);
+
+    return Response.json(
+      {
+        success: false,
+        error: "Could not load customer addresses",
+      },
+      { status: 500 }
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Admin create customer delivery address API
+|--------------------------------------------------------------------------
+*/
+
+if (request.method === "POST" && customerAddressesMatch) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  try {
+    const customerId = customerAddressesMatch[1];
+
+    let body: Record<string, unknown>;
+    try {
+      body = await request.json() as Record<string, unknown>;
+    } catch {
+      return Response.json(
+        { error: "Request body must be valid JSON" },
+        { status: 400 }
+      );
+    }
+
+    const requiredFields = [
+      "profile_name",
+      "recipient_name",
+      "recipient_phone",
+      "address_line_1",
+      "city",
+      "state",
+      "pincode",
+    ];
+
+    for (const field of requiredFields) {
+      if (
+        typeof body[field] !== "string" ||
+        !(body[field] as string).trim()
+      ) {
+        return Response.json(
+          { error: `${field} is required` },
+          { status: 400 }
+        );
+      }
+    }
+
+    if (!/^\d{6}$/.test(body.pincode as string)) {
+      return Response.json(
+        { error: "PIN code must contain exactly 6 digits" },
+        { status: 400 }
+      );
+    }
+
+    const { data: customer, error: customerError } =
+      await getAdminClient(env)
+        .from("customers")
+        .select("id")
+        .eq("id", customerId)
+        .maybeSingle();
+
+    if (customerError) throw new Error(customerError.message);
+
+    if (!customer) {
+      return Response.json(
+        { error: "Customer not found" },
+        { status: 404 }
+      );
+    }
+
+    const addressPayload = {
+      customer_id: customer.id,
+      profile_name: (body.profile_name as string).trim(),
+      recipient_name: (body.recipient_name as string).trim(),
+      recipient_phone: (body.recipient_phone as string).trim(),
+      email: typeof body.email === "string" ? body.email.trim() || null : null,
+      address_line_1: (body.address_line_1 as string).trim(),
+      address_line_2: typeof body.address_line_2 === "string" ? body.address_line_2.trim() || null : null,
+      city: (body.city as string).trim(),
+      state: (body.state as string).trim(),
+      pincode: (body.pincode as string).trim(),
+      landmark: typeof body.landmark === "string" ? body.landmark.trim() || null : null,
+      is_default: body.is_default === true,
+      is_active: true,
+    };
+
+    const { data, error } = await getAdminClient(env)
+      .from("delivery_addresses")
+      .insert(addressPayload)
+      .select("*")
+      .single();
+
+
+if (error?.code === "23505") {
+  return Response.json(
+    {
+      error: error.message,
+      details: error.details,
+      hint: error.hint,
+      code: error.code,
+    },
+    { status: 409 }
+  );
+}
+
+if (error) {
+  console.error("Delivery address insert failed:", error);
+  return Response.json(
+    {
+      success: false,
+      error: error.message,
+      code: error.code,
+    },
+    { status: 500 }
+  );
+}
+
+if (!data) {
+  return Response.json(
+    { success: false, error: "Address was not returned after insertion" },
+    { status: 500 }
+  );
+}
+
+
+    return Response.json(
+      { success: true, address: data },
+      { status: 201 }
+    );
+  } catch (error) {
+  console.error("Admin create customer address failed:", error);
+
+  return Response.json(
+    {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    },
+    { status: 500 }
+  );
+}
+}
+
+/*
+|--------------------------------------------------------------------------
+| Admin set default customer address API
+|--------------------------------------------------------------------------
+*/
+
+const addressDefaultMatch = url.pathname.match(
+  /^\/api\/admin\/customers\/(\d+)\/addresses\/(\d+)\/default$/
+);
+
+if (request.method === "PATCH" && addressDefaultMatch) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const customerId = Number(addressDefaultMatch[1]);
+  const addressId = Number(addressDefaultMatch[2]);
+  const client = getAdminClient(env);
+
+  try {
+    // Confirm that the selected address belongs to this customer.
+    const { data: selected, error: lookupError } = await client
+      .from("delivery_addresses")
+      .select("id")
+      .eq("id", addressId)
+      .eq("customer_id", customerId)
+      .eq("is_active", true)
+      .maybeSingle();
+
+    if (lookupError) throw new Error(lookupError.message);
+
+    if (!selected) {
+      return Response.json(
+        { error: "Active address not found for this customer" },
+        { status: 404 }
+      );
+    }
+
+    // Find the current default so it can be restored if needed.
+    const { data: previous, error: previousError } = await client
+      .from("delivery_addresses")
+      .select("id")
+      .eq("customer_id", customerId)
+      .eq("is_active", true)
+      .eq("is_default", true)
+      .maybeSingle();
+
+    if (previousError) throw new Error(previousError.message);
+
+    if (previous?.id === addressId) {
+      return Response.json({ success: true, addressId });
+    }
+
+    // Clear the existing default first to satisfy the unique index.
+    const { error: clearError } = await client
+      .from("delivery_addresses")
+      .update({ is_default: false })
+      .eq("customer_id", customerId)
+      .eq("is_active", true)
+      .eq("is_default", true);
+
+    if (clearError) throw new Error(clearError.message);
+
+    // Set the selected address as default.
+    const { data: updated, error: updateError } = await client
+      .from("delivery_addresses")
+      .update({ is_default: true })
+      .eq("id", addressId)
+      .eq("customer_id", customerId)
+      .eq("is_active", true)
+      .select("id, profile_name, is_default")
+      .maybeSingle();
+
+    if (updateError || !updated) {
+      // Attempt to restore the previous default if the update fails.
+      if (previous) {
+        const { error: restoreError } = await client
+          .from("delivery_addresses")
+          .update({ is_default: true })
+          .eq("id", previous.id)
+          .eq("customer_id", customerId)
+          .eq("is_active", true);
+
+        if (restoreError) {
+          console.error("Could not restore previous default:", restoreError);
+        }
+      }
+
+      throw new Error(updateError?.message ?? "Could not set default address");
+    }
+
+    return Response.json({
+      success: true,
+      address: updated,
+    });
+  } catch (error) {
+    console.error("Set default customer address failed:", error);
+
+    return Response.json(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      },
+      { status: 500 }
+    );
+  }
+}
+
+
 
 		/*
 		|--------------------------------------------------------------------------
@@ -5556,10 +6508,62 @@ await sendWhatsAppMessage(
 			);
 		}
 
-		console.log("[RETURN] Unmatched route 200");
-		return new Response(
-			"WhatsApp commerce bot is running.",
-			{ status: 200 }
-		);
-	},
+		
+    console.log("[RETURN] Unmatched route 200");
+    return new Response(
+      "WhatsApp commerce bot is running.",
+      { status: 200 }
+    );
+}
+
+export default {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<Response> {
+    const origin = request.headers.get("Origin");
+    const allowedOrigins = [
+      "http://localhost:5173",
+    ];
+
+    const corsHeaders = new Headers({
+      "Access-Control-Allow-Methods":
+        "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers":
+        "Content-Type, Authorization",
+      "Vary": "Origin",
+    });
+
+    if (origin && allowedOrigins.includes(origin)) {
+      corsHeaders.set(
+        "Access-Control-Allow-Origin",
+        origin
+      );
+    }
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders,
+      });
+    }
+
+    const response = await handleRequest(
+      request,
+      env,
+      ctx
+    );
+
+    const headers = new Headers(response.headers);
+    corsHeaders.forEach((value, key) => {
+      headers.set(key, value);
+    });
+
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  },
 } satisfies ExportedHandler<Env>;
