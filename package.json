@@ -7,17 +7,22 @@
     "dev": "wrangler dev",
     "start": "wrangler dev",
     "test": "vitest",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "wrangler types",
+    "ingest": "tsx scripts/ingest-pdf.ts"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.12.4",
     "@types/node": "^26.1.2",
+    "@types/pdf-parse": "^1.1.5",
+    "tsx": "^4.23.13",
     "typescript": "^5.5.2",
     "vitest": "~3.2.0",
-    "wrangler": "^4.115.0"
+    "wrangler": "^4.148.0"
   },
   "dependencies": {
     "@supabase/server": "^1.5.3",
-    "@supabase/supabase-js": "^2.111.0"
+    "@supabase/supabase-js": "^2.111.0",
+    "dotenv": "^16.6.1",
+    "pdf-parse": "^1.1.4"
   }
 }

@@ -1,0 +1,20 @@
+SUPABASE_URL=
+SUPABASE_ANON_KEY=
+SUPABASE_SERVICE_ROLE_KEY=
+
+WHATSAPP_TOKEN=
+PHONE_NUMBER_ID=
+
+RAZORPAY_KEY_ID=
+RAZORPAY_KEY_SECRET=
+RAZORPAY_WEBHOOK_SECRET=
+
+OPENAI_API_KEY=
+# Optional, defaults shown
+OPENAI_CHAT_MODEL=gpt-4o-mini
+RAG_MATCH_THRESHOLD=0.75
+
+# Human support number for the "Connect to Agent" WhatsApp direct-chat CTA.
+# International format, digits only (no +, spaces, or leading 00).
+# Placeholder value only — do NOT use a real number here.
+SUPPORT_WHATSAPP_NUMBER=919876543210

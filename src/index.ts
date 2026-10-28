@@ -1,20 +1,62 @@
-// HEY chatbot
+// <<<<<<< HEAD
+// // Hey bot
+// =======
+// // HEY chatbot
+// >>>>>>> main
 import {
 	createClient,
 	SupabaseClient,
 } from "@supabase/supabase-js";
 import {
+	acceptSupportAgentSession,
 	addItemToCart,
+	addSupportMessage,
+	attachSupportSessionMedia,
 	clearCart as clearCommerceCart,
+	closeSupportAgentSession,
+	createSupportSession,
+	createSupportAgentSession,
+	createTicketFromSupportSession,
 	createOrderFromCart,
 	createRazorpayPaymentLink as createCommercePaymentLink,
-	generateAnswer as generateCommerceAnswer,
+	createSupportTicket,
+	ensurePendingOrderDelivery,
+	getConversationState,
+	getOrderDeliveryDetails,
+	getActiveOrWaitingAgentSessionForTicket,
+	getActiveSupportSession,
+	getOrderStatus,
+	getOrderTimeline,
+	getWaitingAgentSessions,
+	isAffirmativeAnswer,
+	getLatestCustomerSupportTicket,
+	getLatestOpenCustomerSupportTicket,
+	getLatestTicketCreatedSupportSession,
+	getSupportAgentSession,
+	getSupportMessages,
+	isNegativeAnswer,
+	getSupportTicket,
 	handleRazorpaySuccessWebhook,
+	saveDeliveryAddressForOrder,
+	setOrderDeliveryResponse,
+	normalizeSupportSessionAnswer,
+	SUPPORT_TICKET_STATUSES,
+	updateSupportSession,
+	updateOrderStatus,
+	updateOrderDeliveryStatus,
+	updateSupportTicketStatus,
 	updateOrderPaymentLink,
 	upsertConversationState,
 	viewCart,
+	type OrderStatus,
+	type SupportAgentSessionRecord,
+	type DeliveryAddressInput,
+	type DeliveryStatus,
+	type SupportTicketRecord,
+	type SupportTicketStatus,
 } from "./commerce";
-import { generateAnswer, generateRAGResponse } from "./rag";
+import { generateAnswer, generateAnswerFromContext, generateRAGResponse, retrieveKnowledgeContext } from "./rag";
+import { answerCommerceQuestion } from "./ai-commerce-router";
 
 interface Env {
 	AI: Ai;
@@ -28,6 +70,18 @@ interface Env {
 	RAZORPAY_KEY_ID: string;
 	RAZORPAY_KEY_SECRET: string;
 	RAZORPAY_WEBHOOK_SECRET: string;
+
+	OPENAI_API_KEY: string;
+	OPENAI_CHAT_MODEL?: string;
+	RAG_MATCH_THRESHOLD?: string;
+	ADMIN_API_TOKEN?: string;
+
+	// International-format human support number (digits only or with
+	// separators/+ — normalized by normalizeWhatsAppNumber) used to build the
+	// direct WhatsApp handoff link for the customer-facing "Connect to Agent"
+	// CTA. Not a secret, but kept out of source control like the rest of
+	// this Env — see .dev.vars.example.
+	SUPPORT_WHATSAPP_NUMBER?: string;
 }
 
 interface Product {
@@ -40,6 +94,7 @@ interface Product {
 
 interface Order {
 	id: number;
+	customer_id?: number | null;
 	customer_phone: string;
 	product_id: number;
 	product_name: string;
@@ -53,6 +108,7 @@ interface Order {
 	created_at: string;
 	updated_at: string;
 	paid_at: string | null;
+	order_items?: Array<{ product_name: string; quantity: number }>;
 }
 
 interface Cart {
@@ -96,9 +152,41 @@ interface AITextResponse {
 
 const VERIFY_TOKEN = "whatsapp-bot-secret-123";
 
+interface AdminOrderStatusRequest {
+	status?: string;
+	reason?: string;
+	changed_by?: string;
+	changed_by_role?: string;
+}
+
+interface AdminOrderDeliveryStatusRequest {
+	status?: string;
+}
+
+interface AdminTicketStatusRequest {
+	status?: string;
+}
+
+interface AdminTicketReplyRequest {
+	message?: string;
+}
+
+interface AgentAcceptRequest {
+	agentId?: string;
+}
+
+interface AgentReplyRequest {
+	agentId?: string;
+	message?: string;
+}
+
+interface AgentEndRequest {
+	agentId?: string;
+}
+
 /*
 |--------------------------------------------------------------------------
-| Supabase clients
+| Supabase clients - test msg
 |--------------------------------------------------------------------------
 */
 
@@ -197,6 +285,559 @@ async function sendWhatsAppMessage(
 		},
 		env
 	);
+}
+
+type DeliveryCollectionStep =
+	| "CHOICE"
+	| "RECIPIENT_NAME"
+	| "RECIPIENT_PHONE"
+	| "EMAIL"
+	| "ADDRESS_LINE_1"
+	| "ADDRESS_LINE_2"
+	| "CITY"
+	| "STATE"
+	| "PINCODE"
+	| "LANDMARK";
+
+const DELIVERY_STEP_PROMPTS: Record<Exclude<DeliveryCollectionStep, "CHOICE">, string> = {
+	RECIPIENT_NAME: "Please enter the recipient's name.",
+	RECIPIENT_PHONE: "Please enter the recipient's phone number, including country code.",
+	EMAIL: "Enter an email address, or reply SKIP if you do not want to provide one.",
+	ADDRESS_LINE_1: "Enter the delivery address (house or building and street).",
+	ADDRESS_LINE_2: "Enter an apartment or second address line, or reply SKIP.",
+	CITY: "Which city should we deliver to?",
+	STATE: "Which state should we deliver to?",
+	PINCODE: "Enter the 6-digit delivery pincode.",
+	LANDMARK: "Enter a nearby landmark, or reply SKIP.",
+};
+
+const DELIVERY_STEP_ORDER: readonly Exclude<DeliveryCollectionStep, "CHOICE">[] = [
+	"RECIPIENT_NAME",
+	"RECIPIENT_PHONE",
+	"EMAIL",
+	"ADDRESS_LINE_1",
+	"ADDRESS_LINE_2",
+	"CITY",
+	"STATE",
+	"PINCODE",
+	"LANDMARK",
+];
+
+async function sendDeliveryChoicePrompt(
+	to: string,
+	orderId: number,
+	totalAmount: number,
+	env: Env
+): Promise<void> {
+	await sendWhatsAppPayload(
+		{
+			messaging_product: "whatsapp",
+			recipient_type: "individual",
+			to,
+			type: "interactive",
+			interactive: {
+				type: "button",
+				body: {
+					text: [
+						"✅ Payment received!",
+						"",
+						`Order #${orderId} is confirmed. Amount paid: ₹${totalAmount}.`,
+						"",
+						"Would you like to add delivery details for this order?",
+					].join("\n"),
+				},
+				action: {
+					buttons: [
+						{ type: "reply", reply: { id: "DELIVERY_DETAILS_YES", title: "Yes" } },
+						{ type: "reply", reply: { id: "DELIVERY_DETAILS_NO", title: "No" } },
+					],
+				},
+			},
+		},
+		env
+	);
+}
+
+async function ensureDeliveryFollowUp(
+	orderId: number,
+	customerPhone: string,
+	env: Env
+): Promise<SupportTicketRecord> {
+	const client = getAdminClient(env);
+	const { data: existing, error: lookupError } = await client
+		.from("support_tickets")
+		.select("*")
+		.eq("order_id", orderId)
+		.eq("issue_type", "DELIVERY_DETAILS_PENDING")
+		.in("status", ["OPEN", "IN_PROGRESS", "WAITING_CUSTOMER", "WAITING_AGENT"])
+		.order("created_at", { ascending: false })
+		.limit(1)
+		.maybeSingle();
+
+	if (lookupError) {
+		throw new Error(`Delivery follow-up lookup failed: ${lookupError.message}`);
+	}
+	if (existing) {
+		return existing as SupportTicketRecord;
+	}
+
+	return createSupportTicket(
+		{
+			customerPhone,
+			orderId,
+			issueType: "DELIVERY_DETAILS_PENDING",
+			issueDescription: "Customer declined to enter delivery details after payment. Customer care must collect the recipient and delivery address.",
+			priority: "NORMAL",
+		},
+		env
+	);
+}
+
+function readDeliveryAddressDraft(value: unknown): Partial<DeliveryAddressInput> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return {};
+	}
+	return value as Partial<DeliveryAddressInput>;
+}
+
+async function sendDeliveryStepPrompt(
+	to: string,
+	step: DeliveryCollectionStep,
+	env: Env,
+	prefix?: string
+): Promise<void> {
+	if (step === "CHOICE") {
+		await sendWhatsAppMessage(to, prefix ?? "Please choose Yes or No to continue.", env);
+		return;
+	}
+	await sendWhatsAppMessage(
+		to,
+		[prefix, DELIVERY_STEP_PROMPTS[step]].filter(Boolean).join("\n\n"),
+		env
+	);
+}
+
+async function handleDeliveryConversation(
+	sender: string,
+	incomingText: string,
+	buttonId: string,
+	env: Env
+): Promise<boolean> {
+	const conversation = await getConversationState(sender, env);
+	if (!conversation || conversation.state !== "DELIVERY_DETAILS") {
+		return false;
+	}
+
+	const context = conversation.context ?? {};
+	const orderId = Number(context.order_id);
+	const step = context.step as DeliveryCollectionStep;
+	if (!Number.isSafeInteger(orderId) || orderId <= 0 || !(step in DELIVERY_STEP_PROMPTS || step === "CHOICE")) {
+		throw new Error(`Invalid persisted delivery conversation state for ${sender}`);
+	}
+
+	const delivery = readDeliveryAddressDraft(context.delivery);
+	const answer = incomingText.trim();
+	if (!answer && !buttonId) {
+		await sendDeliveryStepPrompt(sender, step, env);
+		return true;
+	}
+
+	if (step === "CHOICE") {
+		const choice = buttonId === "DELIVERY_DETAILS_YES" || /^(yes|y|yeah|yep)$/i.test(answer)
+			? "YES"
+			: buttonId === "DELIVERY_DETAILS_NO" || /^(no|n|nope)$/i.test(answer)
+				? "NO"
+				: null;
+
+		if (!choice) {
+			await sendDeliveryStepPrompt(sender, "CHOICE", env);
+			return true;
+		}
+
+		await setOrderDeliveryResponse(orderId, choice, env);
+		if (choice === "NO") {
+			const { data: order, error } = await getAdminClient(env)
+				.from("orders")
+				.select("customer_phone")
+				.eq("id", orderId)
+				.eq("customer_phone", sender)
+				.maybeSingle();
+			if (error || !order) {
+				throw new Error(`Delivery follow-up order lookup failed: ${error?.message ?? "Order not found for this customer"}`);
+			}
+
+			const ticket = await ensureDeliveryFollowUp(orderId, sender, env);
+			await upsertConversationState(sender, "MAIN_MENU", env, {}, answer || buttonId);
+			await sendWhatsAppMessage(
+				sender,
+				[
+					"Thank you. Our customer care team will contact you shortly to collect delivery details and schedule the delivery.",
+					"",
+					`Follow-up reference: ${ticket.ticket_number}`,
+				].join("\n"),
+				env
+			);
+			return true;
+		}
+
+		const firstStep = DELIVERY_STEP_ORDER[0];
+		await upsertConversationState(
+			sender,
+			"DELIVERY_DETAILS",
+			env,
+			{ source: "PAYMENT_SUCCESS_DELIVERY", order_id: orderId, step: firstStep, delivery },
+			answer || buttonId
+		);
+		await sendDeliveryStepPrompt(sender, firstStep, env);
+		return true;
+	}
+
+	const currentIndex = DELIVERY_STEP_ORDER.indexOf(step as Exclude<DeliveryCollectionStep, "CHOICE">);
+	if (currentIndex < 0) {
+		throw new Error(`Unsupported delivery collection step: ${String(step)}`);
+	}
+	const nextStep = DELIVERY_STEP_ORDER[currentIndex + 1];
+	const skip = /^(skip|none|no|n\/a)$/i.test(answer);
+	const nextDelivery: Partial<DeliveryAddressInput> = { ...delivery };
+	let fieldError: string | null = null;
+
+	switch (step) {
+		case "RECIPIENT_NAME":
+			if (!answer.trim() || answer.length > 100) fieldError = "Please enter a recipient name up to 100 characters.";
+			else nextDelivery.recipient_name = answer;
+			break;
+		case "RECIPIENT_PHONE": {
+			const phone = answer.replace(/\D/g, "");
+			if (phone.length < 8 || phone.length > 15) fieldError = "Enter a valid phone number containing 8 to 15 digits.";
+			else nextDelivery.recipient_phone = phone;
+			break;
+		}
+		case "EMAIL":
+			if (skip) nextDelivery.email = null;
+			else if (answer.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(answer)) fieldError = "Enter a valid email address, or reply SKIP.";
+			else nextDelivery.email = answer;
+			break;
+		case "ADDRESS_LINE_1":
+			if (!answer.trim() || answer.length > 500) fieldError = "Please enter an address up to 500 characters.";
+			else nextDelivery.address_line_1 = answer;
+			break;
+		case "ADDRESS_LINE_2":
+			if (!skip && answer.length > 500) fieldError = "The second address line must be 500 characters or fewer, or reply SKIP.";
+			else nextDelivery.address_line_2 = skip ? null : answer;
+			break;
+		case "CITY":
+			if (!answer.trim() || answer.length > 100) fieldError = "Please enter a city up to 100 characters.";
+			else nextDelivery.city = answer;
+			break;
+		case "STATE":
+			if (!answer.trim() || answer.length > 100) fieldError = "Please enter a state up to 100 characters.";
+			else nextDelivery.state = answer;
+			break;
+		case "PINCODE":
+			if (!/^\d{6}$/.test(answer)) fieldError = "Pincode must contain exactly 6 digits.";
+			else nextDelivery.pincode = answer;
+			break;
+		case "LANDMARK":
+			if (!skip && answer.length > 200) fieldError = "The landmark must be 200 characters or fewer, or reply SKIP.";
+			else nextDelivery.landmark = skip ? null : answer;
+			break;
+	}
+
+	if (fieldError) {
+		await sendDeliveryStepPrompt(sender, step, env, fieldError);
+		return true;
+	}
+
+	if (nextStep) {
+		await upsertConversationState(
+			sender,
+			"DELIVERY_DETAILS",
+			env,
+			{ source: "PAYMENT_SUCCESS_DELIVERY", order_id: orderId, step: nextStep, delivery: nextDelivery },
+			answer
+		);
+		await sendDeliveryStepPrompt(sender, nextStep, env);
+		return true;
+	}
+
+	const saved = await saveDeliveryAddressForOrder(orderId, sender, nextDelivery as DeliveryAddressInput, env);
+	await upsertConversationState(sender, "MAIN_MENU", env, {}, answer);
+	await sendWhatsAppMessage(
+		sender,
+		[
+			`✅ Delivery details saved for order #${orderId}.`,
+			`Recipient: ${saved.address.recipient_name}`,
+			`Delivery status: ${saved.delivery.delivery_status}.`,
+			"",
+			"You can add another delivery location with a future order.",
+		].join("\n"),
+		env
+	);
+	return true;
+}
+
+const CUSTOMER_NOTIFICATION_STATUSES: Record<string, string> = {
+	PACKED: "📦 Order packed and awaiting shipment.",
+	SHIPPED: "🚚 Order shipped.",
+	OUT_FOR_DELIVERY: "🛵 Out for delivery.",
+	DELIVERED: "✅ Delivered successfully.",
+};
+
+async function sendOrderStatusNotification(
+	orderId: number,
+	status: OrderStatus,
+	env: Env
+): Promise<void> {
+	console.log("[ORDER STATUS NOTIFICATION] Started", { orderId, status });
+	const message = CUSTOMER_NOTIFICATION_STATUSES[status];
+	if (!message) {
+		console.log("[ORDER STATUS NOTIFICATION] No notification configured", { orderId, status });
+		return;
+	}
+
+	const client = getAdminClient(env);
+	const { data: event, error: eventLookupError } = await client
+		.from("notification_events")
+		.select("id, customer_phone, payload")
+		.eq("order_id", orderId)
+		.eq("related_status", status)
+		.eq("status", "queued")
+		.order("created_at", { ascending: false })
+		.limit(1)
+		.maybeSingle();
+	console.log("[ORDER STATUS NOTIFICATION] Event lookup result", {
+		orderId,
+		status,
+		eventId: event?.id ?? null,
+		hasEvent: Boolean(event),
+		error: eventLookupError?.message ?? null,
+	});
+
+	if (eventLookupError) {
+		console.error("Notification event lookup failed:", eventLookupError);
+		return;
+	}
+
+	if (!event) {
+		console.error("Queued notification event not found:", { orderId, status });
+		return;
+	}
+
+	const payload = {
+		...((event.payload as Record<string, unknown> | null) ?? {}),
+		message,
+	};
+
+	try {
+		console.log("[ORDER STATUS NOTIFICATION] Sending WhatsApp message", {
+			orderId,
+			status,
+			customerPhone: event.customer_phone,
+		});
+		await sendWhatsAppMessage(
+			String(event.customer_phone),
+			[`Order #${orderId}`, message].join("\n"),
+			env
+		);
+		console.log("[ORDER STATUS NOTIFICATION] Meta response received", {
+			orderId,
+			status,
+			result: "success",
+		});
+
+		const { error: sentUpdateError } = await client
+			.from("notification_events")
+			.update({
+				status: "sent",
+				payload,
+				sent_at: new Date().toISOString(),
+				updated_at: new Date().toISOString(),
+			})
+			.eq("id", event.id)
+			.eq("status", "queued");
+		console.log("[ORDER STATUS NOTIFICATION] Sent-state update result", {
+			orderId,
+			status,
+			eventId: event.id,
+			success: !sentUpdateError,
+			error: sentUpdateError?.message ?? null,
+		});
+
+		if (sentUpdateError) {
+			console.error("Notification event sent-state update failed:", sentUpdateError);
+		}
+	} catch (error) {
+		console.error("Order status WhatsApp notification failed:", error);
+		const { error: failedUpdateError } = await client
+			.from("notification_events")
+			.update({
+				status: "failed",
+				payload,
+				reason: error instanceof Error ? error.message : "WhatsApp delivery failed",
+				updated_at: new Date().toISOString(),
+			})
+			.eq("id", event.id)
+			.eq("status", "queued");
+		console.log("[ORDER STATUS NOTIFICATION] Failed-state update result", {
+			orderId,
+			status,
+			eventId: event.id,
+			success: !failedUpdateError,
+			error: failedUpdateError?.message ?? null,
+		});
+
+		if (failedUpdateError) {
+			console.error("Notification event failed-state update failed:", failedUpdateError);
+		}
+	}
+}
+
+const SUPPORT_TICKET_NOTIFICATION_MESSAGES: Record<string, string> = {
+	"OPEN->IN_PROGRESS": [
+		"📢 Ticket Update",
+		"",
+		"Status: IN_PROGRESS",
+		"",
+		"Our support team is reviewing your request.",
+	].join("\n"),
+	"OPEN->WAITING_CUSTOMER": [
+		"📢 Ticket Update",
+		"",
+		"Status: WAITING_CUSTOMER",
+		"",
+		"We need additional information from you.",
+	].join("\n"),
+	"IN_PROGRESS->RESOLVED": [
+		"✅ Ticket Resolved",
+		"",
+		"Your issue has been resolved.",
+	].join("\n"),
+	"RESOLVED->CLOSED": [
+		"✅ Ticket Closed",
+		"",
+		"This support request has been closed.",
+	].join("\n"),
+};
+
+async function sendSupportTicketStatusNotification(
+	previousStatus: SupportTicketStatus,
+	ticket: {
+		id: number;
+		ticket_number: string;
+		customer_phone: string;
+		order_id: number | null;
+		status: SupportTicketStatus;
+	},
+	env: Env
+): Promise<void> {
+	const transition = `${previousStatus}->${ticket.status}`;
+	const notificationMessage = SUPPORT_TICKET_NOTIFICATION_MESSAGES[transition];
+
+	if (!notificationMessage) {
+		return;
+	}
+
+	const client = getAdminClient(env);
+	const payload = {
+		ticket_id: ticket.id,
+		ticket_number: ticket.ticket_number,
+		previous_status: previousStatus,
+		status: ticket.status,
+	};
+
+	const { data: existingEvent, error: lookupError } = await client
+		.from("notification_events")
+		.select("id, status")
+		.eq("event_type", "support_ticket_status_changed")
+		.contains("payload", payload)
+		.in("status", ["queued", "sent"])
+		.limit(1)
+		.maybeSingle();
+
+	if (lookupError) {
+		console.error("[SUPPORT TICKET NOTIFICATION] Duplicate check failed:", lookupError);
+		return;
+	}
+
+	if (existingEvent) {
+		console.log("[SUPPORT TICKET NOTIFICATION] Duplicate notification skipped", {
+			ticketId: ticket.id,
+			ticketNumber: ticket.ticket_number,
+			transition,
+			eventId: existingEvent.id,
+		});
+		return;
+	}
+
+	const { data: event, error: insertError } = await client
+		.from("notification_events")
+		.insert({
+			order_id: ticket.order_id,
+			customer_phone: ticket.customer_phone,
+			event_type: "support_ticket_status_changed",
+			channel: "whatsapp",
+			status: "queued",
+			related_status: ticket.status,
+			payload,
+		})
+		.select("id")
+		.single();
+
+	if (insertError || !event) {
+		console.error("[SUPPORT TICKET NOTIFICATION] Event creation failed:", insertError);
+		return;
+	}
+
+	const message = [
+		notificationMessage,
+		"",
+		`Ticket Number: ${ticket.ticket_number}`,
+	].join("\n");
+
+	try {
+		console.log("[SUPPORT TICKET NOTIFICATION] Sending WhatsApp message", {
+			ticketId: ticket.id,
+			ticketNumber: ticket.ticket_number,
+			transition,
+			eventId: event.id,
+		});
+		await sendWhatsAppMessage(ticket.customer_phone, message, env);
+
+		const { error: sentError } = await client
+			.from("notification_events")
+			.update({
+				status: "sent",
+				sent_at: new Date().toISOString(),
+				updated_at: new Date().toISOString(),
+			})
+			.eq("id", event.id)
+			.eq("status", "queued");
+
+		console.log("[SUPPORT TICKET NOTIFICATION] Sent-state update result", {
+			ticketId: ticket.id,
+			eventId: event.id,
+			success: !sentError,
+			error: sentError?.message ?? null,
+		});
+	} catch (error) {
+		console.error("[SUPPORT TICKET NOTIFICATION] WhatsApp delivery failed:", error);
+		const { error: failedError } = await client
+			.from("notification_events")
+			.update({
+				status: "failed",
+				reason: error instanceof Error ? error.message : "WhatsApp delivery failed",
+				updated_at: new Date().toISOString(),
+			})
+			.eq("id", event.id)
+			.eq("status", "queued");
+
+		console.log("[SUPPORT TICKET NOTIFICATION] Failed-state update result", {
+			ticketId: ticket.id,
+			eventId: event.id,
+			success: !failedError,
+			error: failedError?.message ?? null,
+		});
+	}
 }
 
 /*
@@ -533,7 +1174,7 @@ async function sendCartActions(
 							type: "reply",
 							reply: {
 								id: "ADD_MORE_PRODUCTS",
-								title: "Add More",
+								title: "Continue Shopping",
 							},
 						},
 						{
@@ -992,9 +1633,44 @@ function getOrderStatusLabel(
 		failed: "Payment setup failed",
 		cancelled: "Cancelled",
 		fulfilled: "Completed",
+		PACKED: "Packed and awaiting shipment",
+		SHIPPED: "Shipped",
+		OUT_FOR_DELIVERY: "Out for delivery",
+		DELIVERED: "Delivered successfully",
 	};
 
 	return labels[status] ?? status;
+}
+
+function getCustomerOrderStatusMessage(status: string): string | null {
+	const messages: Record<string, string> = {
+		paid: "✅ Payment received.",
+		PACKED: "📦 Order packed and awaiting shipment.",
+		SHIPPED: "🚚 Order shipped.",
+		OUT_FOR_DELIVERY: "🛵 Out for delivery.",
+		DELIVERED: "✅ Delivered successfully.",
+	};
+
+	return messages[status] ?? null;
+}
+
+function buildProductLines(order: Order): string[] {
+	const productNames =
+		order.order_items && order.order_items.length > 0
+			? order.order_items.map((item) => item.product_name)
+			: order.product_name
+				? [order.product_name]
+				: [];
+
+	if (productNames.length === 0) {
+		return [`Product: ${order.product_name}`];
+	}
+
+	if (productNames.length === 1) {
+		return [`Product: ${productNames[0]}`];
+	}
+
+	return ["Product:", ...productNames.map((name) => `- ${name}`)];
 }
 
 function createOrderStatusMessage(
@@ -1004,7 +1680,7 @@ function createOrderStatusMessage(
 		"📦 Order Status",
 		"",
 		`Order: #${order.id}`,
-		`Product: ${order.product_name}`,
+		...buildProductLines(order),
 		`Quantity: ${order.quantity}`,
 		`Amount: ₹${order.total_amount}`,
 		`Status: ${getOrderStatusLabel(order.status)}`,
@@ -1046,7 +1722,7 @@ async function processLatestOrder(
 	const { data, error } = await supabase
 		.from("orders")
 		.select(
-			"id, customer_phone, product_id, product_name, quantity, unit_price, total_amount, status, razorpay_payment_link_id, razorpay_payment_link_url, razorpay_payment_id, created_at, updated_at, paid_at"
+			"id, customer_phone, product_id, product_name, quantity, unit_price, total_amount, status, razorpay_payment_link_id, razorpay_payment_link_url, razorpay_payment_id, created_at, updated_at, paid_at, order_items(product_name, quantity)"
 		)
 		.eq("customer_phone", sender)
 		.order("created_at", {
@@ -1069,11 +1745,7 @@ async function processLatestOrder(
 	if (!data) {
 		await sendWhatsAppMessage(
 			sender,
-			[
-				"No orders were found for this WhatsApp number.",
-				"",
-				"Select View Products to place your first order.",
-			].join("\n"),
+			"No active orders found.",
 			env
 		);
 
@@ -1082,12 +1754,113 @@ async function processLatestOrder(
 
 	const order =
 		data as unknown as Order;
+	const status = await getOrderStatus(order.id, env);
+	const timeline = await getOrderTimeline(order.id, env);
+	const lifecycleMessage = getCustomerOrderStatusMessage(status);
+	const statusMessage = lifecycleMessage
+		? [lifecycleMessage, `Status: ${getOrderStatusLabel(status)}`].join("\n")
+		: createOrderStatusMessage({ ...order, status });
+
+	console.log("Order tracking timeline loaded:", {
+		orderId: order.id,
+		status,
+		timelineEntries: timeline.length,
+	});
 
 	await sendWhatsAppMessage(
 		sender,
-		createOrderStatusMessage(order),
+		statusMessage,
 		env
 	);
+}
+
+/*
+|--------------------------------------------------------------------------
+| Order selection list (TRACK_ORDER)
+|--------------------------------------------------------------------------
+*/
+
+async function sendOrderSelectionList(
+	sender: string,
+	env: Env
+): Promise<void> {
+	const supabase = getAdminClient(env);
+
+	const { data, error } = await supabase
+		.from("orders")
+		.select(
+			"id, customer_phone, product_id, product_name, quantity, unit_price, total_amount, status, razorpay_payment_link_id, razorpay_payment_link_url, razorpay_payment_id, created_at, updated_at, paid_at, order_items(product_name, quantity)"
+		)
+		.eq("customer_phone", sender)
+		.order("created_at", { ascending: false })
+		.limit(10);
+
+	if (error) {
+		console.error("Order list lookup failed:", error);
+		throw new Error("Could not look up orders");
+	}
+
+	const orders = (data ?? []) as unknown as Order[];
+
+	if (orders.length === 0) {
+		await sendWhatsAppMessage(
+			sender,
+			"No orders were found for your account.",
+			env
+		);
+		return;
+	}
+
+	const rows = orders.map((order) => {
+		const productNames =
+			order.order_items && order.order_items.length > 0
+				? order.order_items.map((item) => item.product_name)
+				: order.product_name
+					? [order.product_name]
+					: [];
+		const productSummary = productNames.length > 0 ? productNames.join(", ") : "Order";
+		const orderDate = new Date(order.created_at).toLocaleDateString("en-IN", {
+			day: "numeric",
+			month: "short",
+			year: "numeric",
+		});
+
+		return {
+			id: `TRACK_ORDER_${order.id}`,
+			title: `Order #${order.id}`.slice(0, 24),
+			description: `${productSummary} • ${orderDate}`.slice(0, 72),
+		};
+	});
+
+	await sendWhatsAppPayload(
+		{
+			messaging_product: "whatsapp",
+			recipient_type: "individual",
+			to: sender,
+			type: "interactive",
+			interactive: {
+				type: "list",
+				body: {
+					text: "Select an order to track",
+				},
+				action: {
+					button: "View Orders",
+					sections: [
+						{
+							title: "Your Orders",
+							rows,
+						},
+					],
+				},
+			},
+		},
+		env
+	);
+
+	console.log("Interactive order list sent", {
+		sender,
+		orderCount: orders.length,
+	});
 }
 
 /*
@@ -1123,7 +1896,7 @@ async function processTrackOrderById(
 	const { data, error } = await supabase
 		.from("orders")
 		.select(
-			"id, customer_phone, product_id, product_name, quantity, unit_price, total_amount, status, razorpay_payment_link_id, razorpay_payment_link_url, razorpay_payment_id, created_at, updated_at, paid_at"
+			"id, customer_phone, product_id, product_name, quantity, unit_price, total_amount, status, razorpay_payment_link_id, razorpay_payment_link_url, razorpay_payment_id, created_at, updated_at, paid_at, order_items(product_name, quantity)"
 		)
 		.eq("id", orderId)
 		.eq("customer_phone", sender)
@@ -1143,11 +1916,7 @@ async function processTrackOrderById(
 	if (!data) {
 		await sendWhatsAppMessage(
 			sender,
-			[
-				`Order #${orderId} was not found for this WhatsApp number.`,
-				"",
-				"Tap Track Order to view your latest order.",
-			].join("\n"),
+			"No active orders found.",
 			env
 		);
 
@@ -1156,12 +1925,1000 @@ async function processTrackOrderById(
 
 	const order =
 		data as unknown as Order;
+	const status = await getOrderStatus(order.id, env);
+	const timeline = await getOrderTimeline(order.id, env);
+	const lifecycleMessage = getCustomerOrderStatusMessage(status);
+	const statusMessage = lifecycleMessage
+		? [lifecycleMessage, `Status: ${getOrderStatusLabel(status)}`].join("\n")
+		: createOrderStatusMessage({ ...order, status });
+
+	console.log("Order tracking timeline loaded:", {
+		orderId: order.id,
+		status,
+		timelineEntries: timeline.length,
+	});
 
 	await sendWhatsAppMessage(
 		sender,
-		createOrderStatusMessage(order),
+		statusMessage,
 		env
 	);
+}
+
+type SupportIssueType =
+	| "REFUND"
+	| "DAMAGED_PRODUCT"
+	| "REPLACEMENT_REQUEST"
+	| "REFUND_REQUEST"
+	| "WRONG_ITEM"
+	| "PAYMENT_ISSUE"
+	| "HUMAN_AGENT"
+	| "GENERAL_SUPPORT";
+
+function isDamagedProductIntent(message: string): boolean {
+	const hasDamageTerm = /\b(broke|broken|damaged)\b/.test(message);
+	const hasProductContext = /\b(product|item|order|watch|shirt|shoe|shoes|bag)\b/.test(message);
+	const hasReceivedProductContext = /\breceived\b/.test(message) && /\b(product|item)\b/.test(message);
+
+	return hasDamageTerm && (hasProductContext || hasReceivedProductContext);
+}
+
+function isReplacementRequest(message: string): boolean {
+	return /\b(replace|replacement)\b/.test(message) && /\b(item|product|order|it|this|that)\b/.test(message)
+		|| /^\s*(need|want)\s+replacement\b/.test(message);
+}
+
+function isRefundRequest(message: string): boolean {
+	return /\b(refund|refund\s+my\s+money)\b/.test(message);
+}
+
+async function getLatestCustomerOrder(sender: string, env: Env): Promise<Order | null> {
+	const supabase = getAdminClient(env);
+	const { data, error } = await supabase
+		.from("orders")
+		.select("id, customer_id, customer_phone, product_id, product_name, quantity, unit_price, total_amount, status, razorpay_payment_link_id, razorpay_payment_link_url, razorpay_payment_id, created_at, updated_at, paid_at")
+		.eq("customer_phone", sender)
+		.order("created_at", { ascending: false })
+		.limit(1)
+		.maybeSingle();
+
+	if (error) {
+		throw new Error(`Latest order lookup failed: ${error.message}`);
+	}
+
+	return (data as Order | null) ?? null;
+}
+
+async function sendDamagedProductActionButtons(
+	to: string,
+	env: Env
+): Promise<void> {
+	await sendWhatsAppPayload(
+		{
+			messaging_product: "whatsapp",
+			recipient_type: "individual",
+			to,
+			type: "interactive",
+			interactive: {
+				type: "button",
+				header: {
+					type: "text",
+						text: "Support Ticket Created",
+				},
+				body: {
+					text: [
+							"Would you like to connect to a support agent?",
+						"",
+							"Choose an option below.",
+					].join("\n"),
+				},
+				footer: {
+					text: "We will proceed with the next step.",
+				},
+				action: {
+					buttons: [
+						{
+							type: "reply",
+							reply: {
+								id: "TALK_AGENT",
+								title: "Talk to Agent",
+							},
+						},
+						{
+							type: "reply",
+							reply: {
+								id: "NO_THANKS",
+								title: "No Thanks",
+							},
+						},
+					],
+				},
+			},
+		},
+		env
+	);
+}
+
+async function sendPostImageSupportActions(
+	to: string,
+	ticketNumber: string,
+	env: Env
+): Promise<void> {
+	await sendWhatsAppPayload(
+		{
+			messaging_product: "whatsapp",
+			recipient_type: "individual",
+			to,
+			type: "interactive",
+			interactive: {
+				type: "button",
+				body: {
+					text: [
+						"✅ Evidence received",
+						"",
+						`Ticket: ${ticketNumber}`,
+						"",
+						"What would you like to do next?",
+					].join("\n"),
+				},
+				action: {
+					buttons: [
+						{ type: "reply", reply: { id: "CONNECT_AGENT", title: "Connect Agent" } },
+						{ type: "reply", reply: { id: "TRACK_TICKET", title: "Track Ticket" } },
+						{ type: "reply", reply: { id: "CANCEL_REQUEST", title: "Cancel Request" } },
+					],
+				},
+			},
+		},
+		env
+	);
+}
+
+async function sendDamagedProductResolutionCheck(
+	to: string,
+	troubleshootingMessage: string,
+	env: Env
+): Promise<void> {
+	await sendWhatsAppPayload(
+		{
+			messaging_product: "whatsapp",
+			recipient_type: "individual",
+			to,
+			type: "interactive",
+			interactive: {
+				type: "button",
+				body: {
+					text: troubleshootingMessage,
+				},
+				action: {
+					buttons: [
+						{ type: "reply", reply: { id: "ISSUE_RESOLVED", title: "Issue Resolved" } },
+						{ type: "reply", reply: { id: "CONNECT_AGENT", title: "Connect Agent" } },
+					],
+				},
+			},
+		},
+		env
+	);
+}
+
+type SupportIntent = "CONTINUE_SUPPORT" | "CLOSE_SUPPORT_TICKET";
+
+async function classifySupportIntent(
+	message: string,
+	env: Env
+): Promise<SupportIntent> {
+	const response = await fetch("https://api.openai.com/v1/chat/completions", {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({
+			model: env.OPENAI_CHAT_MODEL || "gpt-4o-mini",
+			temperature: 0,
+			max_tokens: 10,
+			messages: [
+				{
+					role: "system",
+					content: [
+						"You are a support-ticket intent classifier.",
+						"Determine whether the customer wants:",
+						"CONTINUE_SUPPORT or CLOSE_SUPPORT_TICKET",
+						"Return ONLY the intent.",
+					].join("\n"),
+				},
+				{ role: "user", content: message },
+			],
+		}),
+	});
+
+	if (!response.ok) {
+		const errorBody = await response.text();
+		throw new Error(`Support intent classification failed (${response.status}): ${errorBody}`);
+	}
+
+	const result = await response.json() as {
+		choices?: Array<{ message?: { content?: string } }>;
+	};
+	const intent = result.choices?.[0]?.message?.content?.trim().toUpperCase();
+
+	return intent === "CLOSE_SUPPORT_TICKET"
+		? "CLOSE_SUPPORT_TICKET"
+		: "CONTINUE_SUPPORT";
+}
+
+async function closeWaitingAgentTicket(
+	sender: string,
+	ticket: SupportTicketRecord,
+	env: Env,
+	customClosingMessage?: string
+): Promise<void> {
+	const closedTicket = await updateSupportTicketStatus(ticket.id, "CLOSED", env);
+	await addSupportMessage(
+		ticket.id,
+		"AGENT",
+		"Customer closed the conversation.",
+		env,
+		"system"
+	);
+
+	const agentSession = await getActiveOrWaitingAgentSessionForTicket(ticket.id, env);
+	if (agentSession) {
+		await closeSupportAgentSession(agentSession.id, env);
+	}
+
+	console.log("[SUPPORT INTENT CLOSE]", {
+		ticketId: closedTicket.id,
+		ticketNumber: closedTicket.ticket_number,
+	});
+	console.log("[SUPPORT TICKET CLOSED]", {
+		ticketId: closedTicket.id,
+		ticketNumber: closedTicket.ticket_number,
+	});
+	await sendWhatsAppMessage(
+		sender,
+		customClosingMessage ?? [
+			"✅ Your support ticket has been closed.",
+			"",
+			`Ticket Number: ${closedTicket.ticket_number}`,
+			"",
+			"If you need help again, simply send another message.",
+		].join("\n"),
+		env
+	);
+}
+
+async function processWaitingAgentCustomerMessage(
+	sender: string,
+	message: string,
+	env: Env
+): Promise<boolean> {
+	const ticket = await getLatestCustomerSupportTicket(sender, env);
+	if (!ticket) {
+		return false;
+	}
+
+	const agentSession = await getActiveOrWaitingAgentSessionForTicket(ticket.id, env);
+	if (!agentSession) {
+		return false;
+	}
+
+	if (agentSession.status === "WAITING_FOR_AGENT") {
+		const intent = await classifySupportIntent(message, env);
+		if (intent === "CLOSE_SUPPORT_TICKET") {
+			await closeWaitingAgentTicket(sender, ticket, env);
+			return true;
+		}
+	}
+
+	await addSupportMessage(ticket.id, "CUSTOMER", message, env, sender);
+	console.log("[AGENT CUSTOMER MESSAGE]", {
+		sessionId: agentSession.id,
+		ticketId: ticket.id,
+		messageLength: message.length,
+	});
+	return true;
+}
+
+function isNaturalAgentRequest(message: string): boolean {
+	return /\b(agent|customer\s+agent|human|live\s+support|talk\s+to\s+agent|support\s+executive|representative|customer\s+care)\b/.test(message);
+}
+
+/*
+|--------------------------------------------------------------------------
+| Direct human-agent WhatsApp handoff (CTA link, not the bot-mediated
+| agent-session flow — see startAgentHandoff below, kept intact/unused
+| by this path per the feature spec).
+|--------------------------------------------------------------------------
+*/
+
+// Single place for phone-number formatting for this feature. Strips
+// everything but digits and applies a sane international-length bound —
+// intentionally not full E.164 validation (country-specific rules vary),
+// just enough to reject obviously-broken configuration before it becomes a
+// broken customer-facing link.
+export function normalizeWhatsAppNumber(value: string | undefined | null): string | null {
+	if (!value) {
+		return null;
+	}
+	const digitsOnly = value.replace(/\D/g, "");
+	if (digitsOnly.length < 8 || digitsOnly.length > 15) {
+		return null;
+	}
+	return digitsOnly;
+}
+
+export function buildAgentWhatsAppUrl(
+	normalizedSupportNumber: string,
+	prefilledMessage: string
+): string {
+	return `https://wa.me/${normalizedSupportNumber}?text=${encodeURIComponent(prefilledMessage)}`;
+}
+
+function formatIssueTypeLabel(issueType: string): string {
+	return issueType
+		.toLowerCase()
+		.split("_")
+		.filter(Boolean)
+		.map((word) => word[0].toUpperCase() + word.slice(1))
+		.join(" ");
+}
+
+export function buildAgentHandoffMessage(
+	ticket?: Pick<SupportTicketRecord, "ticket_number" | "issue_type"> | null
+): string {
+	const lines = ["Hi, I need help with my support request."];
+	if (ticket) {
+		lines.push("", `Ticket: #${ticket.ticket_number}`, `Issue: ${formatIssueTypeLabel(ticket.issue_type)}`);
+	}
+	return lines.join("\n");
+}
+
+async function sendConnectAgentCta(sender: string, env: Env): Promise<void> {
+	const normalizedNumber = normalizeWhatsAppNumber(env.SUPPORT_WHATSAPP_NUMBER);
+
+	if (!normalizedNumber) {
+		console.error("[CONNECT AGENT CTA] SUPPORT_WHATSAPP_NUMBER is missing or invalid; cannot build direct-chat link", {
+			configured: Boolean(env.SUPPORT_WHATSAPP_NUMBER),
+		});
+		await sendWhatsAppMessage(
+			sender,
+			[
+				"Sorry, our direct support chat isn't available right now.",
+				"",
+				"Please try again shortly, or use Track Ticket to check your request.",
+			].join("\n"),
+			env
+		);
+		return;
+	}
+
+	let ticket: SupportTicketRecord | null = null;
+	try {
+		ticket = await getLatestCustomerSupportTicket(sender, env);
+	} catch (error) {
+		console.error("[CONNECT AGENT CTA] Ticket lookup failed; continuing without ticket context", error);
+	}
+
+	const prefilledMessage = buildAgentHandoffMessage(ticket);
+	const whatsappUrl = buildAgentWhatsAppUrl(normalizedNumber, prefilledMessage);
+
+	await sendWhatsAppPayload(
+		{
+			messaging_product: "whatsapp",
+			recipient_type: "individual",
+			to: sender,
+			type: "interactive",
+			interactive: {
+				type: "cta_url",
+				body: {
+					text: "Need more help? Chat directly with our support team.",
+				},
+				action: {
+					name: "cta_url",
+					parameters: {
+						display_text: "Connect to Agent",
+						url: whatsappUrl,
+					},
+				},
+			},
+		},
+		env
+	);
+
+	console.log("[CONNECT AGENT CTA] Direct WhatsApp handoff link sent", {
+		sender,
+		hasTicket: Boolean(ticket),
+		ticketId: ticket?.id ?? null,
+	});
+}
+
+async function startAgentHandoff(
+	sender: string,
+	env: Env
+): Promise<boolean> {
+	const ticket = await getLatestCustomerSupportTicket(sender, env);
+	if (!ticket || ticket.status !== "OPEN") {
+		return false;
+	}
+
+	await createSupportAgentSession(ticket.id, sender, env);
+	const waitingTicket = await updateSupportTicketStatus(ticket.id, "WAITING_AGENT", env);
+	console.log("[AGENT HANDOFF]", {
+		ticketId: waitingTicket.id,
+		ticketNumber: waitingTicket.ticket_number,
+		phoneNumber: sender,
+	});
+	console.log("[AGENT SESSION CREATED]", {
+		ticketId: waitingTicket.id,
+		phoneNumber: sender,
+	});
+	await sendWhatsAppPayload(
+		{
+			messaging_product: "whatsapp",
+			recipient_type: "individual",
+			to: sender,
+			type: "interactive",
+			interactive: {
+				type: "button",
+				body: {
+					text: [
+						"✅ Agent request received",
+						"",
+						`Ticket: ${waitingTicket.ticket_number}`,
+						"",
+						"You have been added to the support queue.",
+						"",
+						"A support agent will join shortly.",
+					].join("\n"),
+				},
+				action: {
+					buttons: [
+						{ type: "reply", reply: { id: "END_CHAT", title: "End Chat" } },
+					],
+				},
+			},
+		},
+		env
+	);
+	return true;
+}
+
+async function startDamagedProductSupportSession(
+	sender: string,
+	message: string,
+	env: Env
+): Promise<void> {
+	const latestOrder = await getLatestCustomerOrder(sender, env);
+	const productName = latestOrder?.product_name ?? "your recent order item";
+	const existingSession = await getActiveSupportSession(sender, env);
+
+	if (existingSession && existingSession.issue_type === "DAMAGED_PRODUCT") {
+		await handleDamagedProductSupportConversation(sender, message, env, existingSession);
+		return;
+	}
+
+	const session = await createSupportSession(
+		{
+			customerPhone: sender,
+			orderId: latestOrder?.id ?? null,
+			issueType: "DAMAGED_PRODUCT",
+			currentStep: "ASK_PRODUCT",
+			productName: latestOrder?.product_name ?? null,
+			collectedData: {
+				issue_type: "DAMAGED_PRODUCT",
+				product_name: latestOrder?.product_name ?? null,
+				order_id: latestOrder?.id ?? null,
+			},
+		},
+		env
+	);
+
+	await upsertConversationState(
+		sender,
+		"CUSTOMER_CARE",
+		env,
+		{ source: "DAMAGED_PRODUCT", session_id: session.id },
+		message
+	);
+
+	await sendWhatsAppMessage(
+		sender,
+		[
+			"I can help with a damaged product.",
+			"",
+			`Is the damaged item the product from your recent order: ${productName}?`,
+			"",
+			"Reply YES or NO. If it is a different product, tell me the product name.",
+		].join("\n"),
+		env
+	);
+}
+
+async function createImmediateSupportTicket(
+	sender: string,
+	message: string,
+	issueType: SupportIssueType,
+	env: Env
+): Promise<void> {
+	const latestOrder = await getLatestCustomerOrder(sender, env);
+	const existingTicket = await getLatestOpenCustomerSupportTicket(sender, env);
+	const session = await createSupportSession(
+		{
+			customerPhone: sender,
+			orderId: latestOrder?.id ?? null,
+			issueType,
+			currentStep: "ASK_IMAGE",
+			productName: latestOrder?.product_name ?? null,
+			issueDescription: message,
+			preferredResolution: issueType === "REFUND_REQUEST" ? "refund" : issueType === "REPLACEMENT_REQUEST" ? "replacement" : null,
+			collectedData: {
+				issue_type: issueType,
+				issue_description: message,
+				product_name: latestOrder?.product_name ?? null,
+			},
+		},
+		env
+	);
+
+	let ticket: SupportTicketRecord;
+	if (existingTicket) {
+		ticket = existingTicket;
+		console.log("[EXISTING OPEN TICKET REUSED]", {
+			ticketId: ticket.id,
+			ticketNumber: ticket.ticket_number,
+			phoneNumber: sender,
+		});
+	} else {
+		ticket = await createSupportTicket(
+			{
+				customerId: latestOrder?.customer_id ?? null,
+				customerPhone: sender,
+				orderId: latestOrder?.id ?? null,
+				issueType,
+				issueDescription: message,
+				productName: latestOrder?.product_name ?? null,
+				preferredResolution: issueType === "REFUND_REQUEST" ? "refund" : issueType === "REPLACEMENT_REQUEST" ? "replacement" : null,
+				priority: "NORMAL",
+			},
+			env
+		);
+		console.log("[SUPPORT TICKET CREATED]", { ticketId: ticket.id, ticketNumber: ticket.ticket_number, issueType });
+	}
+
+	await updateSupportSession(
+		session.id,
+		{ status: "COLLECTING_INFO" },
+		env
+	);
+	console.log("[SUPPORT ROUTE]", { sender, issueType, sessionId: session.id });
+
+	await sendWhatsAppMessage(
+		sender,
+		[
+			"✅ Support request received.",
+			"",
+			`Ticket Number: ${ticket.ticket_number}`,
+			"",
+			"Please upload an image of the product so our support team can review it.",
+		].join("\n"),
+		env
+	);
+}
+
+async function handleDamagedProductSupportConversation(
+	sender: string,
+	incomingText: string,
+	env: Env,
+	session: Awaited<ReturnType<typeof getActiveSupportSession>>
+): Promise<boolean> {
+	if (!session || session.issue_type !== "DAMAGED_PRODUCT") {
+		return false;
+	}
+
+	const text = incomingText.trim();
+	const normalized = normalizeSupportSessionAnswer(text);
+	const existingData = (session.collected_data ?? {}) as Record<string, unknown>;
+
+	if (session.current_step === "ASK_PRODUCT") {
+		if (!text) {
+			await sendWhatsAppMessage(sender, "Please reply YES or NO, or tell me the damaged product name.", env);
+			return true;
+		}
+
+		if (isAffirmativeAnswer(text)) {
+			const productName = session.product_name ?? "your item";
+			await updateSupportSession(
+				session.id,
+				{
+					status: "COLLECTING_INFO",
+					product_name: productName,
+					current_step: "ASK_ISSUE",
+					collected_data: {
+						...existingData,
+						product_confirmed: true,
+						product_name: productName,
+					},
+				},
+				env
+			);
+			await sendWhatsAppMessage(sender, `Thanks. Please describe the damage to ${productName}.`, env);
+			return true;
+		}
+
+		if (isNegativeAnswer(text)) {
+			await updateSupportSession(
+				session.id,
+				{
+					status: "COLLECTING_INFO",
+					current_step: "ASK_PRODUCT",
+					collected_data: {
+						...existingData,
+						product_confirmed: false,
+					},
+				},
+				env
+			);
+			await sendWhatsAppMessage(sender, "Please tell me the damaged product name so I can continue.", env);
+			return true;
+		}
+
+		const productName = text;
+		await updateSupportSession(
+			session.id,
+			{
+				status: "COLLECTING_INFO",
+				product_name: productName,
+				current_step: "ASK_ISSUE",
+				collected_data: {
+					...existingData,
+					product_confirmed: false,
+					product_name: productName,
+				},
+			},
+			env
+		);
+		await sendWhatsAppMessage(sender, `Thanks. Please describe the damage to ${productName}.`, env);
+		return true;
+	}
+
+	if (session.current_step === "ASK_ISSUE") {
+		if (!text) {
+			await sendWhatsAppMessage(sender, "Please tell us how the product was damaged.", env);
+			return true;
+		}
+
+		await updateSupportSession(
+			session.id,
+			{
+				status: "COLLECTING_INFO",
+				issue_description: text,
+				current_step: "ASK_RESOLUTION",
+				summary_text: text,
+				collected_data: {
+					...existingData,
+					issue_description: text,
+					summary_text: text,
+				},
+			},
+			env
+		);
+		await sendWhatsAppMessage(sender, "What resolution would you prefer: refund or replacement?", env);
+		return true;
+	}
+
+	if (session.current_step === "ASK_RESOLUTION") {
+		const resolution = normalized;
+		if (!(/refund|replacement/.test(resolution))) {
+			await sendWhatsAppMessage(sender, "Please reply with either refund or replacement.", env);
+			return true;
+		}
+
+		const preferredResolution = resolution.includes("refund") ? "refund" : "replacement";
+		await updateSupportSession(
+			session.id,
+			{
+				status: "COLLECTING_INFO",
+				preferred_resolution: preferredResolution,
+				current_step: "ASK_IMAGE",
+				collected_data: {
+					...existingData,
+					preferred_resolution: preferredResolution,
+				},
+			},
+			env
+		);
+		await sendWhatsAppMessage(sender, "Please upload a clear image of the damaged product so we can review it.", env);
+		return true;
+	}
+
+	if (session.current_step === "WAITING_USER_DECISION") {
+		await sendDamagedProductActionButtons(sender, env);
+		return true;
+	}
+
+	return false;
+}
+
+function resolveSupportIssueType(message: string): SupportIssueType {
+	if (isDamagedProductIntent(message)) {
+		return "DAMAGED_PRODUCT";
+	}
+
+	if (isReplacementRequest(message)) {
+		return "REPLACEMENT_REQUEST";
+	}
+
+	if (isRefundRequest(message)) {
+		return "REFUND_REQUEST";
+	}
+
+	if (/\bwrong\s+(item|product)\b/.test(message)) {
+		return "WRONG_ITEM";
+	}
+
+	if (/\bpayment\s+(issue|problem)\b/.test(message)) {
+		return "PAYMENT_ISSUE";
+	}
+
+	if (/\bneed\s+(a\s+)?human\s+agent\b/.test(message) || /\btalk\s+to\s+support\b/.test(message)) {
+		return "HUMAN_AGENT";
+	}
+
+	return "GENERAL_SUPPORT";
+}
+
+function isSupportIntent(message: string): boolean {
+	return (
+		isDamagedProductIntent(message) ||
+		isReplacementRequest(message) ||
+		isRefundRequest(message) ||
+		/\bwrong\s+(item|product)\b/.test(message) ||
+		/\breplacement\b/.test(message) ||
+		/\bpayment\s+(issue|problem)\b/.test(message) ||
+		/\bneed\s+(a\s+)?human\s+agent\b/.test(message) ||
+		/\btalk\s+to\s+support\b/.test(message) ||
+		/\bcustomer\s+support\b/.test(message)
+	);
+}
+
+// Matches a message that is ONLY a greeting (optionally with trailing
+// punctuation/"there"), tolerating repeated letters ("hii", "hiii") and
+// case. Anchored with ^...$ so a greeting attached to a substantive request
+// ("hi, where is my order?") deliberately does NOT match — that message
+// must continue through normal intent handling instead of stopping at the
+// main menu.
+export function isGreetingOnly(message: string): boolean {
+	const normalized = message.trim().toLowerCase();
+	return /^((h+i+|h+e+y+)(\s+there)?|h+e+l+l+o+|good\s+(morning|afternoon|evening))[\s!.,]*$/.test(normalized);
+}
+
+export function isSupportStatusIntent(message: string): boolean {
+	return (
+		/\btrack\s+ticket\b/.test(message) ||
+		/\bticket\s+status\b/.test(message) ||
+		/\bmy\s+ticket\b/.test(message) ||
+		/\bsupport\s+update\b/.test(message) ||
+		/\bcomplaint\s+status\b/.test(message) ||
+		/\bcheck\s+my\s+ticket\b/.test(message) ||
+		/\bsupport\s+ticket\b/.test(message) ||
+		/\brequest\s+status\b/.test(message) ||
+		/\bmy\s+complaint\b/.test(message) ||
+		/\bupdate\s+on\s+my\s+(complaint|ticket|refund|support|replacement)\b/.test(message)
+	);
+}
+
+// Narrower than isSupportStatusIntent: matches messages that clearly want to
+// append information to an existing ticket, as opposed to checking its
+// status. Checked before isSupportStatusIntent so append-phrasing (e.g. "add
+// this to my ticket") isn't swallowed by the broader "my ticket" status match.
+export function hasExplicitTicketAppendIntent(message: string): boolean {
+	return (
+		(/\b(add|attach|append|note|here)\b/.test(message) && /\bticket\b/.test(message)) ||
+		(/\bmore\s+information\b/.test(message) && /\bticket\b/.test(message)) ||
+		/\btkt-[a-z0-9-]+\b/i.test(message)
+	);
+}
+
+async function processSupportTicketStatusRequest(
+	sender: string,
+	env: Env
+): Promise<void> {
+	const ticket = await getLatestCustomerSupportTicket(sender, env);
+	if (!ticket) {
+		console.log('[SUPPORT TICKET LOOKUP] No active ticket found', { phoneNumber: sender });
+		await sendWhatsAppMessage(
+			sender,
+			"No support tickets were found for your account.",
+			env
+		);
+		return;
+	}
+
+	console.log('[SUPPORT TICKET LOOKUP] Sending ticket status', {
+		phoneNumber: sender,
+		ticketNumber: ticket.ticket_number,
+		status: ticket.status,
+	});
+
+	await sendWhatsAppMessage(
+		sender,
+		[
+			"🎫 Support Ticket Status",
+			"",
+			`Ticket Number: ${ticket.ticket_number}`,
+			"",
+			`Issue Type: ${ticket.issue_type}`,
+			"",
+			`Status: ${ticket.status}`,
+			`Created: ${new Date(ticket.created_at).toLocaleString("en-IN")}`,
+		].join("\n"),
+		env
+	);
+}
+
+async function processSupportRequest(
+	sender: string,
+	message: string,
+	env: Env,
+	issueTypeOverride?: SupportIssueType
+): Promise<void> {
+	const supabase = getAdminClient(env);
+	const { data: latestOrder, error: orderError } = await supabase
+		.from("orders")
+		.select("id, customer_id")
+		.eq("customer_phone", sender)
+		.order("created_at", { ascending: false })
+		.limit(1)
+		.maybeSingle();
+
+	if (orderError) {
+		console.error("Support latest-order lookup failed:", orderError);
+		throw new Error("Could not look up latest order for support ticket");
+	}
+
+	const issueType = issueTypeOverride ?? resolveSupportIssueType(message);
+	const existingTicket = await getLatestOpenCustomerSupportTicket(sender, env);
+
+	let ticket: SupportTicketRecord;
+	if (existingTicket) {
+		ticket = existingTicket;
+		console.log("[EXISTING OPEN TICKET REUSED]", {
+			ticketId: ticket.id,
+			ticketNumber: ticket.ticket_number,
+			phoneNumber: sender,
+		});
+	} else {
+		ticket = await createSupportTicket(
+			{
+				customerId: latestOrder?.customer_id ?? null,
+				customerPhone: sender,
+				orderId: latestOrder?.id ?? null,
+				issueType,
+			},
+			env
+		);
+		console.log("[SUPPORT TICKET CREATED]", { ticketId: ticket.id, ticketNumber: ticket.ticket_number, issueType });
+	}
+
+	await sendWhatsAppMessage(
+		sender,
+		[
+			"🎫 Ticket Created",
+			"",
+			`Ticket Number: ${ticket.ticket_number}`,
+			"",
+			`Issue Type: ${ticket.issue_type}`,
+			"",
+			"Status: OPEN",
+			"",
+			"Our support team will contact you shortly.",
+		].join("\n"),
+		env
+	);
+}
+
+async function processSupportImageMessage(
+	sender: string,
+	image: { id?: string; url?: string },
+	env: Env
+): Promise<boolean> {
+	const ticket = await getLatestCustomerSupportTicket(sender, env);
+	if (!ticket) {
+		console.log("[SUPPORT IMAGE] No active ticket found", { phoneNumber: sender });
+		return false;
+	}
+
+	if (!image.id) {
+		console.error("[SUPPORT IMAGE] Image media id missing", { phoneNumber: sender });
+		return false;
+	}
+
+	const { error } = await getAdminClient(env)
+		.from("ticket_messages")
+		.insert({
+			ticket_id: ticket.id,
+			sender_type: "CUSTOMER",
+			message: null,
+			message_type: "IMAGE",
+			media_id: image.id,
+			image_url: image.url ?? null,
+		});
+
+	if (error) {
+		throw new Error(`Support image message creation failed: ${error.message}`);
+	}
+
+	console.log("[SUPPORT IMAGE] Image attached to ticket", {
+		phoneNumber: sender,
+		ticketId: ticket.id,
+		ticketNumber: ticket.ticket_number,
+		mediaId: image.id,
+		hasImageUrl: Boolean(image.url),
+	});
+
+	const agentSession = await getActiveOrWaitingAgentSessionForTicket(ticket.id, env);
+	if (agentSession) {
+		console.log("[AGENT CUSTOMER IMAGE]", {
+			sessionId: agentSession.id,
+			ticketId: ticket.id,
+			mediaId: image.id,
+		});
+		return true;
+	}
+
+	await sendPostImageSupportActions(sender, ticket.ticket_number, env);
+	console.log("[SUPPORT POST IMAGE ACTIONS]", {
+		ticketId: ticket.id,
+		ticketNumber: ticket.ticket_number,
+		phoneNumber: sender,
+	});
+
+	return true;
+}
+
+async function processSupportTextMessage(
+	sender: string,
+	message: string,
+	env: Env
+): Promise<boolean> {
+	const ticket = await getLatestCustomerSupportTicket(sender, env);
+	if (!ticket) {
+		return false;
+	}
+
+	const { error } = await getAdminClient(env)
+		.from("ticket_messages")
+		.insert({
+			ticket_id: ticket.id,
+			sender_type: "CUSTOMER",
+			message,
+			message_type: "TEXT",
+		});
+
+	if (error) {
+		throw new Error(`Support text message creation failed: ${error.message}`);
+	}
+
+	console.log("[SUPPORT TEXT] Message added to ticket", {
+		phoneNumber: sender,
+		ticketId: ticket.id,
+		ticketNumber: ticket.ticket_number,
+		messageLength: message.length,
+	});
+
+	await sendWhatsAppMessage(
+		sender,
+		[
+			"✅ Message added to your support ticket.",
+			"",
+			`Ticket Number: ${ticket.ticket_number}`,
+		].join("\n"),
+		env
+	);
+
+	return true;
 }
 
 /*
@@ -2050,20 +3807,74 @@ async function generateAIResponse(
 		SUPABASE_URL: env.SUPABASE_URL,
 		SUPABASE_SERVICE_ROLE_KEY: env.SUPABASE_SERVICE_ROLE_KEY,
 		SUPABASE_ANON_KEY: env.SUPABASE_ANON_KEY,
+		OPENAI_API_KEY: env.OPENAI_API_KEY,
+		OPENAI_CHAT_MODEL: env.OPENAI_CHAT_MODEL,
+		RAG_MATCH_THRESHOLD: env.RAG_MATCH_THRESHOLD,
 	});
 }
-export default {
-	async fetch(
-		request: Request,
-		env: Env,
-		ctx: ExecutionContext
-	): Promise<Response> {
-		const url = new URL(request.url);
-		console.log(
-			"[REQUEST]",
-			request.method,
-			url.pathname
-		);
+
+function isAdminRequest(request: Request, env: Env): boolean {
+	return Boolean(
+		env.ADMIN_API_TOKEN &&
+		request.headers.get("Authorization") === `Bearer ${env.ADMIN_API_TOKEN}`
+	);
+}
+
+// Agent identity must be a short identifier (name, employee code, email —
+// e.g. "Priya Singh", "agent-042"), never chat message text. A production
+// incident showed a whole customer-facing sentence ("how can i help you")
+// submitted as agentId on an /accept call — this is the server-side guard
+// against that entire class of mistake, independent of what any client
+// (dashboard UI, Postman, a future client) actually sends.
+export function isValidAgentId(value: string): boolean {
+	const trimmed = value.trim();
+	if (!trimmed || trimmed.length > 40) {
+		return false;
+	}
+	if (trimmed.includes("?")) {
+		return false;
+	}
+	return trimmed.split(/\s+/).length <= 4;
+}
+
+function getAdminStatusErrorResponse(error: unknown): Response {
+	const message = error instanceof Error ? error.message : "Admin order status update failed";
+	const status = message === "Order not found"
+		? 404
+		: message.startsWith("Invalid order status transition")
+			? 409
+			: message.startsWith("Unsupported order status") || message.startsWith("Order status is required")
+				? 400
+				: 500;
+
+	return Response.json({ error: message }, { status });
+}
+
+function getAdminDeliveryStatusErrorResponse(error: unknown): Response {
+	const message = error instanceof Error ? error.message : "Admin delivery status update failed";
+	const status = message.includes("Delivery record not found")
+		? 404
+		: message.startsWith("Invalid delivery status transition")
+			? 409
+			: 500;
+
+	return Response.json({ error: message }, { status });
+}
+
+
+async function handleRequest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<Response> {
+  const url = new URL(request.url);
+
+  console.log(
+    "[REQUEST]",
+    request.method,
+    url.pathname
+  );
+
 
 		if (request.method === "GET" && url.pathname === "/message") {
 			console.log("[RETURN] GET /message 200");
@@ -2104,6 +3915,1584 @@ if (
 		answer,
 	});
 }
+
+		/*
+		|--------------------------------------------------------------------------
+		| Admin orders API
+		|--------------------------------------------------------------------------
+		*/
+
+		if (request.method === "GET" && url.pathname === "/api/admin/orders") {
+			if (!env.ADMIN_API_TOKEN) {
+				return Response.json(
+					{ error: "Admin API is not configured" },
+					{ status: 503 }
+				);
+			}
+
+			if (!isAdminRequest(request, env)) {
+				return Response.json({ error: "Unauthorized" }, { status: 401 });
+			}
+
+			try {
+				const orders: Order[] = [];
+				const pageSize = 1000;
+				let from = 0;
+				let page: Order[];
+
+				do {
+					const { data, error } = await getAdminClient(env)
+						.from("orders")
+						.select("*")
+						.order("created_at", { ascending: false })
+						.range(from, from + pageSize - 1);
+
+					if (error) {
+						throw new Error(error.message);
+					}
+
+					page = (data ?? []) as Order[];
+					orders.push(...page);
+					from += pageSize;
+				} while (page.length === pageSize);
+
+				return Response.json({
+					success: true,
+					count: orders.length,
+					orders,
+				});
+			} catch (error) {
+				console.error("Admin order list failed:", error);
+				return Response.json(
+					{ success: false, error: "Could not load orders" },
+					{ status: 500 }
+				);
+			}
+		}
+		
+if (
+  request.method === "GET" &&
+  url.pathname === "/api/admin/customers"
+) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const { data, error } = await getAdminClient(env)
+      .from("customers")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) throw new Error(error.message);
+	
+const { data: orders, error: ordersError } = await getAdminClient(env)
+  .from("orders")
+  .select("id, customer_id, created_at");
+
+if (ordersError) throw new Error(ordersError.message);
+const customersWithOrderStats = (data ?? []).map((customer) => {
+  const customerOrders = (orders ?? []).filter(
+    (order) => String(order.customer_id) === String(customer.id)
+  );
+
+  const latestOrder = customerOrders.reduce<
+    (typeof customerOrders)[number] | null
+  >((latest, order) => {
+    if (!latest) return order;
+
+    return new Date(order.created_at).getTime() >
+      new Date(latest.created_at).getTime()
+      ? order
+      : latest;
+  }, null);
+
+  return {
+    ...customer,
+    total_orders: customerOrders.length,
+    last_order: latestOrder?.created_at ?? null,
+  };
+});
+
+    return Response.json({
+  success: true,
+  count: customersWithOrderStats.length,
+  customers: customersWithOrderStats,
+});
+  } catch (error) {
+    console.error("Admin customer list failed:", error);
+
+    return Response.json(
+      { success: false, error: "Could not load customers" },
+      { status: 500 }
+    );
+  }
+}
+
+
+
+/*
+|--------------------------------------------------------------------------
+| Admin customer details API
+|--------------------------------------------------------------------------
+*/
+
+
+const customerDetailsMatch = url.pathname.match(
+  /^\/api\/admin\/customers\/([^/]+)$/
+);
+
+if (
+  (request.method === "GET" || request.method === "PATCH") &&
+  customerDetailsMatch
+) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const customerId = customerDetailsMatch[1];
+    const supabase = getAdminClient(env);
+
+    if (request.method === "GET") {
+      const { data, error } = await supabase
+        .from("customers")
+        .select("*")
+        .eq("id", customerId)
+        .maybeSingle();
+
+      if (error) throw new Error(error.message);
+
+      if (!data) {
+        return Response.json(
+          { error: "Customer not found" },
+          { status: 404 }
+        );
+      }
+
+      return Response.json({
+        success: true,
+        customer: data,
+      });
+    }
+
+    const updates = await request.json();
+
+    // Only allow fields that the Edit Customer form updates.
+    const allowedFields = ["name", "email", "phone"];
+    const safeUpdates: Record<string, unknown> = {};
+
+    for (const field of allowedFields) {
+      if (Object.prototype.hasOwnProperty.call(updates, field)) {
+        safeUpdates[field] = updates[field];
+      }
+    }
+
+    if (Object.keys(safeUpdates).length === 0) {
+      return Response.json(
+        { error: "No valid customer fields provided" },
+        { status: 400 }
+      );
+    }
+
+    const { data, error } = await supabase
+      .from("customers")
+      .update(safeUpdates)
+      .eq("id", customerId)
+      .select("*")
+      .maybeSingle();
+
+    if (error) throw new Error(error.message);
+
+    if (!data) {
+      return Response.json(
+        { error: "Customer not found" },
+        { status: 404 }
+      );
+    }
+
+    return Response.json({
+      success: true,
+      customer: data,
+    });
+  } catch (error) {
+    console.error("Admin customer details failed:", error);
+
+    return Response.json(
+      {
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : "Could not process customer request",
+      },
+      { status: 500 }
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Admin carts API
+|--------------------------------------------------------------------------
+*/
+
+if (
+  request.method === "GET" &&
+  url.pathname === "/api/admin/carts"
+) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const supabase = getAdminClient(env);
+
+    // Fetch carts, newest first.
+    const { data: carts, error: cartsError } = await supabase
+      .from("carts")
+      .select("*")
+      .order("updated_at", { ascending: false });
+
+    if (cartsError) throw new Error(cartsError.message);
+
+    // Fetch all cart items.
+    const { data: items, error: itemsError } = await supabase
+      .from("cart_items")
+      .select("*");
+
+    if (itemsError) throw new Error(itemsError.message);
+
+    // Attach each cart's products to the matching cart.
+    const cartsWithItems = (carts ?? []).map((cart) => ({
+      ...cart,
+      items: (items ?? []).filter(
+        (item) => String(item.cart_id) === String(cart.id)
+      ),
+    }));
+
+    return Response.json({
+      success: true,
+      count: cartsWithItems.length,
+      carts: cartsWithItems,
+    });
+  } catch (error) {
+    console.error("Admin cart list failed:", error);
+
+    return Response.json(
+      { success: false, error: "Could not load carts" },
+      { status: 500 }
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Admin products API
+|--------------------------------------------------------------------------
+*/
+
+if (
+  request.method === "GET" &&
+  url.pathname === "/api/admin/products"
+) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const supabase = getAdminClient(env);
+
+    const { data: products, error } = await supabase
+      .from("products")
+      .select("id, created_at, name, price, description, stock, is_active")
+      .order("created_at", { ascending: false });
+
+    if (error) throw new Error(error.message);
+
+    return Response.json({
+      success: true,
+      count: products?.length ?? 0,
+      products: products ?? [],
+    });
+  } catch (error) {
+    console.error("Admin products list failed:", error);
+
+    return Response.json(
+      { success: false, error: "Could not load products" },
+      { status: 500 }
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Admin update product API
+|--------------------------------------------------------------------------
+*/
+
+const productUpdateMatch = url.pathname.match(
+  /^\/api\/admin\/products\/(\d+)$/
+);
+
+if (
+  request.method === "PATCH" &&
+  productUpdateMatch
+) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const productId = Number(productUpdateMatch[1]);
+    const body: unknown = await request.json();
+
+    if (
+      typeof body !== "object" ||
+      body === null ||
+      Array.isArray(body)
+    ) {
+      return Response.json(
+        { error: "Invalid request body" },
+        { status: 400 }
+      );
+    }
+
+    const input = body as Record<string, unknown>;
+    const allowedFields = [
+      "name",
+      "price",
+      "description",
+      "stock",
+      "is_active",
+    ];
+
+    const updates: Record<string, unknown> = {};
+
+    for (const key of Object.keys(input)) {
+      if (!allowedFields.includes(key)) {
+        return Response.json(
+          { error: `Field not allowed: ${key}` },
+          { status: 400 }
+        );
+      }
+
+      updates[key] = input[key];
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return Response.json(
+        { error: "No fields to update" },
+        { status: 400 }
+      );
+    }
+
+    if (
+      "name" in updates &&
+      (typeof updates.name !== "string" ||
+        !updates.name.trim())
+    ) {
+      return Response.json(
+        { error: "Product name is required" },
+        { status: 400 }
+      );
+    }
+
+    if (
+      "price" in updates &&
+      (typeof updates.price !== "number" ||
+        !Number.isFinite(updates.price) ||
+        updates.price < 0)
+    ) {
+      return Response.json(
+        { error: "Price must be a non-negative number" },
+        { status: 400 }
+      );
+    }
+
+    if (
+      "stock" in updates &&
+      (!Number.isInteger(updates.stock) ||
+        (updates.stock as number) < 0)
+    ) {
+      return Response.json(
+        { error: "Stock must be a non-negative integer" },
+        { status: 400 }
+      );
+    }
+
+    if (
+      "description" in updates &&
+      typeof updates.description !== "string"
+    ) {
+      return Response.json(
+        { error: "Description must be text" },
+        { status: 400 }
+      );
+    }
+
+    if (
+      "is_active" in updates &&
+      typeof updates.is_active !== "boolean"
+    ) {
+      return Response.json(
+        { error: "is_active must be true or false" },
+        { status: 400 }
+      );
+    }
+
+    if ("name" in updates) {
+      updates.name = (updates.name as string).trim();
+    }
+
+    const supabase = getAdminClient(env);
+
+    const { data: product, error } = await supabase
+      .from("products")
+      .update(updates)
+      .eq("id", productId)
+      .select(
+        "id, created_at, name, price, description, stock, is_active"
+      )
+      .maybeSingle();
+
+    if (error) throw new Error(error.message);
+
+    if (!product) {
+      return Response.json(
+        { error: "Product not found" },
+        { status: 404 }
+      );
+    }
+
+    return Response.json({
+      success: true,
+      product,
+    });
+  } catch (error) {
+    console.error("Admin product update failed:", error);
+
+    return Response.json(
+      { success: false, error: "Could not update product" },
+      { status: 500 }
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Admin conversations API
+|--------------------------------------------------------------------------
+*/
+
+if (
+  request.method === "GET" &&
+  url.pathname === "/api/admin/conversations"
+) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const supabase = getAdminClient(env);
+
+    const [
+      { data: contexts, error: contextsError },
+      { data: states, error: statesError },
+    ] = await Promise.all([
+      supabase
+        .from("conversation_context")
+        .select("phone_number, last_product, last_order_id, last_intent, updated_at")
+        .order("updated_at", { ascending: false })
+        .limit(500),
+
+      supabase
+        .from("conversation_state")
+        .select("id, whatsapp_number, state, context, last_message, created_at, updated_at")
+        .order("updated_at", { ascending: false })
+        .limit(500),
+    ]);
+
+    if (contextsError) throw new Error(contextsError.message);
+    if (statesError) throw new Error(statesError.message);
+
+    return Response.json({
+      success: true,
+      contexts: contexts ?? [],
+      states: states ?? [],
+    });
+  } catch (error) {
+    console.error("Admin conversations list failed:", error);
+
+    return Response.json(
+      { success: false, error: "Could not load conversations" },
+      { status: 500 }
+    );
+  }
+}
+
+
+
+/*
+|--------------------------------------------------------------------------
+| Admin customer orders API
+|--------------------------------------------------------------------------
+*/
+
+const customerOrdersMatch = url.pathname.match(
+  /^\/api\/admin\/customers\/([^/]+)\/orders$/
+);
+
+if (request.method === "GET" && customerOrdersMatch) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const customerId = customerOrdersMatch[1];
+
+    const { data, error } = await getAdminClient(env)
+      .from("orders")
+      .select("*")
+      .eq("customer_id", customerId)
+      .order("created_at", { ascending: false });
+
+    if (error) throw new Error(error.message);
+
+    return Response.json({
+      success: true,
+      count: data?.length ?? 0,
+      orders: data ?? [],
+    });
+  } catch (error) {
+    console.error("Admin customer orders failed:", error);
+
+    return Response.json(
+      { success: false, error: "Could not load customer orders" },
+      { status: 500 }
+    );
+  }
+}
+
+
+		/*
+		|--------------------------------------------------------------------------
+		| Admin order status API
+		|--------------------------------------------------------------------------
+		*/
+
+		const adminStatusMatch = url.pathname.match(/^\/api\/admin\/orders\/(\d+)\/status$/);
+		if (request.method === "POST" && adminStatusMatch) {
+			if (!env.ADMIN_API_TOKEN) {
+				return Response.json(
+					{ error: "Admin API is not configured" },
+					{ status: 503 }
+				);
+			}
+
+			if (!isAdminRequest(request, env)) {
+				return Response.json({ error: "Unauthorized" }, { status: 401 });
+			}
+
+			const orderId = Number(adminStatusMatch[1]);
+			let body: AdminOrderStatusRequest;
+			try {
+				body = await request.json() as AdminOrderStatusRequest;
+			} catch {
+				return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
+			}
+
+			if (!body.status || typeof body.status !== "string") {
+				return Response.json({ error: "Order status is required" }, { status: 400 });
+			}
+
+			try {
+				await getOrderStatus(orderId, env);
+				const order = await updateOrderStatus(
+					orderId,
+					body.status as OrderStatus,
+					env,
+					{
+						changedBy: body.changed_by ?? "admin-api",
+						changedByRole: body.changed_by_role ?? "admin",
+						reason: body.reason ?? null,
+					}
+				);
+				await sendOrderStatusNotification(orderId, order.status as OrderStatus, env);
+				const timeline = await getOrderTimeline(orderId, env);
+				const { data: notificationEvent, error: notificationLookupError } = await getAdminClient(env)
+					.from("notification_events")
+					.select("*")
+					.eq("order_id", orderId)
+					.order("created_at", { ascending: false })
+					.limit(1)
+					.maybeSingle();
+
+				if (notificationLookupError) {
+					throw new Error(`Notification event lookup failed: ${notificationLookupError.message}`);
+				}
+
+				return Response.json({
+					order,
+					timeline,
+					notification_event: notificationEvent,
+				});
+			} catch (error) {
+				console.error("Admin order status update failed:", error);
+				return getAdminStatusErrorResponse(error);
+			}
+		}
+
+		const adminDeliveryStatusMatch = url.pathname.match(
+			/^\/api\/admin\/orders\/(\d+)\/delivery-status$/
+		);
+		if (request.method === "POST" && adminDeliveryStatusMatch) {
+			if (!env.ADMIN_API_TOKEN) {
+				return Response.json(
+					{ error: "Admin API is not configured" },
+					{ status: 503 }
+				);
+			}
+			if (!isAdminRequest(request, env)) {
+				return Response.json({ error: "Unauthorized" }, { status: 401 });
+			}
+
+			const orderId = Number(adminDeliveryStatusMatch[1]);
+			let body: AdminOrderDeliveryStatusRequest;
+			try {
+				body = await request.json() as AdminOrderDeliveryStatusRequest;
+			} catch {
+				return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
+			}
+
+			const validStatuses: readonly DeliveryStatus[] = [
+				"PENDING_DETAILS",
+				"DETAILS_RECEIVED",
+				"READY_FOR_DELIVERY",
+				"OUT_FOR_DELIVERY",
+				"DELIVERED",
+			];
+			if (!body.status || !validStatuses.includes(body.status as DeliveryStatus)) {
+				return Response.json(
+					{ error: "A valid delivery status is required" },
+					{ status: 400 }
+				);
+			}
+
+			try {
+				const delivery = await updateOrderDeliveryStatus(
+					orderId,
+					body.status as DeliveryStatus,
+					env
+				);
+				return Response.json({ delivery });
+			} catch (error) {
+				console.error("Admin delivery status update failed:", error);
+				return getAdminDeliveryStatusErrorResponse(error);
+			}
+		}
+		
+/*
+|--------------------------------------------------------------------------
+| Admin customer delivery addresses API
+|--------------------------------------------------------------------------
+*/
+
+const customerAddressesMatch = url.pathname.match(
+  /^\/api\/admin\/customers\/([^/]+)\/addresses$/
+);
+
+if (request.method === "GET" && customerAddressesMatch) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const customerId = customerAddressesMatch[1];
+
+    const { data, error } = await getAdminClient(env)
+      .from("delivery_addresses")
+      .select("*")
+      .eq("customer_id", customerId)
+      .eq("is_active", true)
+      .order("is_default", { ascending: false })
+      .order("created_at", { ascending: false });
+
+    if (error) throw new Error(error.message);
+
+    return Response.json({
+      success: true,
+      count: data?.length ?? 0,
+      addresses: data ?? [],
+    });
+  } catch (error) {
+    console.error("Admin customer addresses failed:", error);
+
+    return Response.json(
+      {
+        success: false,
+        error: "Could not load customer addresses",
+      },
+      { status: 500 }
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Admin create customer delivery address API
+|--------------------------------------------------------------------------
+*/
+
+if (request.method === "POST" && customerAddressesMatch) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  try {
+    const customerId = customerAddressesMatch[1];
+
+    let body: Record<string, unknown>;
+    try {
+      body = await request.json() as Record<string, unknown>;
+    } catch {
+      return Response.json(
+        { error: "Request body must be valid JSON" },
+        { status: 400 }
+      );
+    }
+
+    const requiredFields = [
+      "profile_name",
+      "recipient_name",
+      "recipient_phone",
+      "address_line_1",
+      "city",
+      "state",
+      "pincode",
+    ];
+
+    for (const field of requiredFields) {
+      if (
+        typeof body[field] !== "string" ||
+        !(body[field] as string).trim()
+      ) {
+        return Response.json(
+          { error: `${field} is required` },
+          { status: 400 }
+        );
+      }
+    }
+
+    if (!/^\d{6}$/.test(body.pincode as string)) {
+      return Response.json(
+        { error: "PIN code must contain exactly 6 digits" },
+        { status: 400 }
+      );
+    }
+
+    const { data: customer, error: customerError } =
+      await getAdminClient(env)
+        .from("customers")
+        .select("id")
+        .eq("id", customerId)
+        .maybeSingle();
+
+    if (customerError) throw new Error(customerError.message);
+
+    if (!customer) {
+      return Response.json(
+        { error: "Customer not found" },
+        { status: 404 }
+      );
+    }
+
+    const addressPayload = {
+      customer_id: customer.id,
+      profile_name: (body.profile_name as string).trim(),
+      recipient_name: (body.recipient_name as string).trim(),
+      recipient_phone: (body.recipient_phone as string).trim(),
+      email: typeof body.email === "string" ? body.email.trim() || null : null,
+      address_line_1: (body.address_line_1 as string).trim(),
+      address_line_2: typeof body.address_line_2 === "string" ? body.address_line_2.trim() || null : null,
+      city: (body.city as string).trim(),
+      state: (body.state as string).trim(),
+      pincode: (body.pincode as string).trim(),
+      landmark: typeof body.landmark === "string" ? body.landmark.trim() || null : null,
+      is_default: body.is_default === true,
+      is_active: true,
+    };
+
+    const { data, error } = await getAdminClient(env)
+      .from("delivery_addresses")
+      .insert(addressPayload)
+      .select("*")
+      .single();
+
+
+if (error?.code === "23505") {
+  return Response.json(
+    {
+      error: error.message,
+      details: error.details,
+      hint: error.hint,
+      code: error.code,
+    },
+    { status: 409 }
+  );
+}
+
+if (error) {
+  console.error("Delivery address insert failed:", error);
+  return Response.json(
+    {
+      success: false,
+      error: error.message,
+      code: error.code,
+    },
+    { status: 500 }
+  );
+}
+
+if (!data) {
+  return Response.json(
+    { success: false, error: "Address was not returned after insertion" },
+    { status: 500 }
+  );
+}
+
+
+    return Response.json(
+      { success: true, address: data },
+      { status: 201 }
+    );
+  } catch (error) {
+  console.error("Admin create customer address failed:", error);
+
+  return Response.json(
+    {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    },
+    { status: 500 }
+  );
+}
+}
+
+/*
+|--------------------------------------------------------------------------
+| Admin set default customer address API
+|--------------------------------------------------------------------------
+*/
+
+const addressDefaultMatch = url.pathname.match(
+  /^\/api\/admin\/customers\/(\d+)\/addresses\/(\d+)\/default$/
+);
+
+if (request.method === "PATCH" && addressDefaultMatch) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const customerId = Number(addressDefaultMatch[1]);
+  const addressId = Number(addressDefaultMatch[2]);
+  const client = getAdminClient(env);
+
+  try {
+    // Confirm that the selected address belongs to this customer.
+    const { data: selected, error: lookupError } = await client
+      .from("delivery_addresses")
+      .select("id")
+      .eq("id", addressId)
+      .eq("customer_id", customerId)
+      .eq("is_active", true)
+      .maybeSingle();
+
+    if (lookupError) throw new Error(lookupError.message);
+
+    if (!selected) {
+      return Response.json(
+        { error: "Active address not found for this customer" },
+        { status: 404 }
+      );
+    }
+
+    // Find the current default so it can be restored if needed.
+    const { data: previous, error: previousError } = await client
+      .from("delivery_addresses")
+      .select("id")
+      .eq("customer_id", customerId)
+      .eq("is_active", true)
+      .eq("is_default", true)
+      .maybeSingle();
+
+    if (previousError) throw new Error(previousError.message);
+
+    if (previous?.id === addressId) {
+      return Response.json({ success: true, addressId });
+    }
+
+    // Clear the existing default first to satisfy the unique index.
+    const { error: clearError } = await client
+      .from("delivery_addresses")
+      .update({ is_default: false })
+      .eq("customer_id", customerId)
+      .eq("is_active", true)
+      .eq("is_default", true);
+
+    if (clearError) throw new Error(clearError.message);
+
+    // Set the selected address as default.
+    const { data: updated, error: updateError } = await client
+      .from("delivery_addresses")
+      .update({ is_default: true })
+      .eq("id", addressId)
+      .eq("customer_id", customerId)
+      .eq("is_active", true)
+      .select("id, profile_name, is_default")
+      .maybeSingle();
+
+    if (updateError || !updated) {
+      // Attempt to restore the previous default if the update fails.
+      if (previous) {
+        const { error: restoreError } = await client
+          .from("delivery_addresses")
+          .update({ is_default: true })
+          .eq("id", previous.id)
+          .eq("customer_id", customerId)
+          .eq("is_active", true);
+
+        if (restoreError) {
+          console.error("Could not restore previous default:", restoreError);
+        }
+      }
+
+      throw new Error(updateError?.message ?? "Could not set default address");
+    }
+
+    return Response.json({
+      success: true,
+      address: updated,
+    });
+  } catch (error) {
+    console.error("Set default customer address failed:", error);
+
+    return Response.json(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      },
+      { status: 500 }
+    );
+  }
+}
+
+
+
+		/*
+		|--------------------------------------------------------------------------
+		| Admin support ticket API
+		|--------------------------------------------------------------------------
+		*/
+
+		const adminTicketMatch = url.pathname.match(/^\/api\/admin\/tickets\/(\d+)$/);
+		const adminTicketStatusMatch = url.pathname.match(/^\/api\/admin\/tickets\/(\d+)\/status$/);
+		const adminTicketReplyMatch = url.pathname.match(/^\/api\/admin\/tickets\/(\d+)\/reply$/);
+		const adminTicketMessagesMatch = url.pathname.match(/^\/api\/admin\/tickets\/(\d+)\/messages$/);
+		const isAdminTicketRoute =
+			url.pathname === "/api/admin/tickets" ||
+			adminTicketMatch ||
+			adminTicketStatusMatch ||
+			adminTicketReplyMatch ||
+			adminTicketMessagesMatch;
+
+		if (adminTicketMessagesMatch) {
+			console.log("[ADMIN AGENT CHAT MATCH]", {
+				method: request.method,
+				pathname: url.pathname,
+				ticketId: Number(adminTicketMessagesMatch[1]),
+			});
+		}
+
+		if (isAdminTicketRoute && !env.ADMIN_API_TOKEN) {
+			return Response.json(
+				{ error: "Admin API is not configured" },
+				{ status: 503 }
+			);
+		}
+
+		if (isAdminTicketRoute && !isAdminRequest(request, env)) {
+			return Response.json({ error: "Unauthorized" }, { status: 401 });
+		}
+
+		if (request.method === "GET" && url.pathname === "/api/admin/tickets") {
+			const { data, error } = await getAdminClient(env)
+				.from("support_tickets")
+				.select("id, ticket_number, order_id, issue_type, status, created_at")
+				.order("created_at", { ascending: false });
+
+			if (error) {
+				console.error("Admin ticket list failed:", error);
+				return Response.json({ error: "Could not load support tickets" }, { status: 500 });
+			}
+
+			return Response.json({
+				tickets: data ?? [],
+			});
+		}
+
+		if (request.method === "POST" && adminTicketMessagesMatch) {
+			console.log("[ADMIN AGENT CHAT POST]", {
+				ticketId: Number(adminTicketMessagesMatch[1]),
+			});
+
+			let body: AdminTicketReplyRequest;
+			try {
+				body = await request.json() as AdminTicketReplyRequest;
+			} catch {
+				return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
+			}
+
+			const reply = body.message?.trim();
+			if (!reply) {
+				return Response.json({ error: "Message is required" }, { status: 400 });
+			}
+
+			try {
+				const ticket = await getSupportTicket(Number(adminTicketMessagesMatch[1]), env);
+				const message = await addSupportMessage(ticket.id, "AGENT", reply, env, "admin-api");
+
+				console.log("[ADMIN AGENT CHAT SEND]", {
+					ticketId: ticket.id,
+					ticketNumber: ticket.ticket_number,
+					customerPhone: ticket.customer_phone,
+				});
+
+				await sendWhatsAppMessage(
+					ticket.customer_phone,
+					[
+						"Support Agent:",
+						"",
+						reply,
+					].join("\n"),
+					env
+				);
+
+				console.log("[ADMIN AGENT CHAT SUCCESS]", {
+					ticketId: ticket.id,
+					messageId: message.id,
+				});
+
+				return Response.json({ success: true });
+			} catch (error) {
+				if (error instanceof Error && error.message === "Support ticket not found") {
+					return Response.json({ error: error.message }, { status: 404 });
+				}
+
+				console.error("Admin agent chat POST failed:", error);
+				return Response.json({ error: "Could not send agent message" }, { status: 500 });
+			}
+		}
+
+		if (request.method === "POST" && adminTicketReplyMatch) {
+			let body: AdminTicketReplyRequest;
+			try {
+				body = await request.json() as AdminTicketReplyRequest;
+			} catch {
+				return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
+			}
+
+			const reply = body.message?.trim();
+			if (!reply) {
+				return Response.json({ error: "Message is required" }, { status: 400 });
+			}
+
+			try {
+				const ticket = await getSupportTicket(Number(adminTicketReplyMatch[1]), env);
+				const customerMessage = [
+					"Support Agent:",
+					"",
+					reply,
+				].join("\n");
+
+				await sendWhatsAppMessage(ticket.customer_phone, customerMessage, env);
+
+				const message = await addSupportMessage(ticket.id, "AGENT", reply, env, "admin-api");
+
+				return Response.json({ message }, { status: 201 });
+			} catch (error) {
+				if (error instanceof Error && error.message === "Support ticket not found") {
+					return Response.json({ error: error.message }, { status: 404 });
+				}
+
+				console.error("Admin ticket reply failed:", error);
+				return Response.json({ error: "Could not send ticket reply" }, { status: 500 });
+			}
+		}
+
+		if (request.method === "GET" && adminTicketMessagesMatch) {
+			try {
+				const ticket = await getSupportTicket(Number(adminTicketMessagesMatch[1]), env);
+				const textMessages = await getSupportMessages(ticket.id, env);
+
+				const { data: imageRows, error: imagesError } = await getAdminClient(env)
+					.from("ticket_messages")
+					.select("id, sender_type, media_id, image_url, created_at")
+					.eq("ticket_id", ticket.id)
+					.eq("message_type", "IMAGE")
+					.order("created_at", { ascending: true });
+
+				if (imagesError) {
+					throw new Error(`Ticket image messages lookup failed: ${imagesError.message}`);
+				}
+
+				const normalizedMessages = [
+					...textMessages.map((message) => ({
+						id: `text-${message.id}`,
+						type: "TEXT" as const,
+						sender_type: message.sender_type,
+						message_text: message.message_text,
+						media_id: null as string | null,
+						image_url: null as string | null,
+						created_at: message.created_at,
+					})),
+					...(imageRows ?? []).map((image) => ({
+						id: `image-${image.id}`,
+						type: "IMAGE" as const,
+						sender_type: image.sender_type,
+						message_text: null as string | null,
+						media_id: image.media_id as string | null,
+						image_url: image.image_url as string | null,
+						created_at: image.created_at,
+					})),
+				].sort(
+					(a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+				);
+
+				return Response.json({ messages: normalizedMessages, ticket_status: ticket.status });
+			} catch (error) {
+				if (error instanceof Error && error.message === "Support ticket not found") {
+					return Response.json({ error: error.message }, { status: 404 });
+				}
+
+				console.error("Admin ticket messages lookup failed:", error);
+				return Response.json({ error: "Could not load ticket messages" }, { status: 500 });
+			}
+		}
+
+		if (request.method === "GET" && adminTicketMatch) {
+			try {
+				const ticket = await getSupportTicket(Number(adminTicketMatch[1]), env);
+				return Response.json({
+					ticket: {
+						id: ticket.id,
+						ticket_number: ticket.ticket_number,
+						customer_phone: ticket.customer_phone,
+						order_id: ticket.order_id,
+						issue_type: ticket.issue_type,
+						issue_description: ticket.issue_description,
+						product_name: ticket.product_name,
+						preferred_resolution: ticket.preferred_resolution,
+						status: ticket.status,
+						created_at: ticket.created_at,
+					},
+				});
+			} catch (error) {
+				if (error instanceof Error && error.message === "Support ticket not found") {
+					return Response.json({ error: error.message }, { status: 404 });
+				}
+
+				console.error("Admin ticket lookup failed:", error);
+				return Response.json({ error: "Could not load support ticket" }, { status: 500 });
+			}
+		}
+
+		if (request.method === "PATCH" && adminTicketStatusMatch) {
+			let body: AdminTicketStatusRequest;
+			try {
+				body = await request.json() as AdminTicketStatusRequest;
+			} catch {
+				return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
+			}
+
+			if (!body.status || !SUPPORT_TICKET_STATUSES.includes(body.status as SupportTicketStatus)) {
+				return Response.json(
+					{ error: "Invalid support ticket status" },
+					{ status: 400 }
+				);
+			}
+
+			try {
+				const previousTicket = await getSupportTicket(
+					Number(adminTicketStatusMatch[1]),
+					env
+				);
+				const ticket = await updateSupportTicketStatus(
+					Number(adminTicketStatusMatch[1]),
+					body.status as SupportTicketStatus,
+					env
+				);
+				await sendSupportTicketStatusNotification(previousTicket.status, ticket, env);
+
+				return Response.json({
+					ticket: {
+						id: ticket.id,
+						ticket_number: ticket.ticket_number,
+						order_id: ticket.order_id,
+						issue_type: ticket.issue_type,
+						status: ticket.status,
+						created_at: ticket.created_at,
+					},
+				});
+			} catch (error) {
+				if (error instanceof Error && error.message === "Support ticket not found") {
+					return Response.json({ error: error.message }, { status: 404 });
+				}
+
+				if (error instanceof Error && error.message.startsWith("Unsupported support ticket status")) {
+					return Response.json({ error: error.message }, { status: 400 });
+				}
+
+				console.error("Admin ticket status update failed:", error);
+				return Response.json({ error: "Could not update support ticket status" }, { status: 500 });
+			}
+		}
+
+		/*
+		|--------------------------------------------------------------------------
+		| Admin agent handoff API
+		|--------------------------------------------------------------------------
+		*/
+
+		const adminAgentAcceptMatch = url.pathname.match(/^\/api\/admin\/agent-sessions\/(\d+)\/accept$/);
+		const adminAgentReplyMatch = url.pathname.match(/^\/api\/admin\/agent-sessions\/(\d+)\/reply$/);
+		const adminAgentEndMatch = url.pathname.match(/^\/api\/admin\/agent-sessions\/(\d+)\/end$/);
+		const isAdminAgentRoute = Boolean(
+			url.pathname === "/api/admin/agent-queue" ||
+			adminAgentAcceptMatch ||
+			adminAgentReplyMatch ||
+			adminAgentEndMatch
+		);
+
+		if (isAdminAgentRoute && !env.ADMIN_API_TOKEN) {
+			return Response.json({ error: "Admin API is not configured" }, { status: 503 });
+		}
+
+		if (isAdminAgentRoute && !isAdminRequest(request, env)) {
+			return Response.json({ error: "Unauthorized" }, { status: 401 });
+		}
+
+		if (request.method === "GET" && url.pathname === "/api/admin/agent-queue") {
+			try {
+				const sessions = await getWaitingAgentSessions(env);
+				const client = getAdminClient(env);
+
+				const queue = await Promise.all(sessions.map(async (session) => {
+					const ticket = await getSupportTicket(session.ticket_id, env);
+					const messages = await getSupportMessages(ticket.id, env);
+					const { data: images, error: imagesError } = await client
+						.from("ticket_messages")
+						.select("id, media_id, image_url, created_at")
+						.eq("ticket_id", ticket.id)
+						.eq("message_type", "IMAGE")
+						.order("created_at", { ascending: false });
+
+					if (imagesError) {
+						console.error("Admin agent queue image lookup failed:", imagesError);
+					}
+
+					return {
+						session_id: session.id,
+						ticket_id: ticket.id,
+						ticket_number: ticket.ticket_number,
+						customer_phone: session.customer_phone,
+						issue_type: ticket.issue_type,
+						ticket_status: ticket.status,
+						session_status: session.status,
+						latest_messages: messages.slice(-5),
+						images: images ?? [],
+					};
+				}));
+
+				return Response.json({ queue });
+			} catch (error) {
+				console.error("Admin agent queue lookup failed:", error);
+				return Response.json({ error: "Could not load agent queue" }, { status: 500 });
+			}
+		}
+
+		if (request.method === "POST" && adminAgentAcceptMatch) {
+			const sessionId = Number(adminAgentAcceptMatch[1]);
+			let body: AgentAcceptRequest;
+			try {
+				body = await request.json() as AgentAcceptRequest;
+			} catch {
+				return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
+			}
+
+			const agentId = body.agentId?.trim();
+			if (!agentId) {
+				return Response.json({ error: "agentId is required" }, { status: 400 });
+			}
+			if (!isValidAgentId(agentId)) {
+				return Response.json(
+					{ error: "agentId must be a short identifier (name or code), not a message" },
+					{ status: 400 }
+				);
+			}
+
+			try {
+				const accepted = await acceptSupportAgentSession(sessionId, agentId, env);
+				if (!accepted) {
+					return Response.json(
+						{ error: "Session is no longer waiting (already accepted or closed)" },
+						{ status: 409 }
+					);
+				}
+
+				const ticket = await updateSupportTicketStatus(accepted.ticket_id, "IN_PROGRESS", env);
+
+				console.log("[AGENT SESSION ACCEPTED]", {
+					sessionId: accepted.id,
+					ticketId: ticket.id,
+					agentId,
+				});
+
+				return Response.json({ session: accepted, ticket });
+			} catch (error) {
+				console.error("Agent session accept failed:", error);
+				return Response.json({ error: "Could not accept agent session" }, { status: 500 });
+			}
+		}
+
+		if (request.method === "POST" && adminAgentReplyMatch) {
+			const sessionId = Number(adminAgentReplyMatch[1]);
+			let body: AgentReplyRequest;
+			try {
+				body = await request.json() as AgentReplyRequest;
+			} catch {
+				return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
+			}
+
+			const agentId = body.agentId?.trim();
+			const replyMessage = body.message?.trim();
+			if (!agentId) {
+				return Response.json({ error: "agentId is required" }, { status: 400 });
+			}
+			if (!isValidAgentId(agentId)) {
+				return Response.json(
+					{ error: "agentId must be a short identifier (name or code), not a message" },
+					{ status: 400 }
+				);
+			}
+			if (!replyMessage) {
+				return Response.json({ error: "message is required" }, { status: 400 });
+			}
+
+			try {
+				const session = await getSupportAgentSession(sessionId, env);
+				if (!session || session.status !== "ACTIVE") {
+					return Response.json({ error: "No active agent session was found" }, { status: 409 });
+				}
+
+				if (session.agent_id !== agentId) {
+					return Response.json({ error: "This session is assigned to a different agent" }, { status: 403 });
+				}
+
+				const ticket = await getSupportTicket(session.ticket_id, env);
+
+				console.log("[AGENT MESSAGE SEND]", {
+					sessionId: session.id,
+					ticketId: ticket.id,
+					agentId,
+					customerPhone: ticket.customer_phone,
+				});
+
+				await sendWhatsAppMessage(
+					ticket.customer_phone,
+					[
+						"Support Agent:",
+						"",
+						replyMessage,
+					].join("\n"),
+					env
+				);
+
+				const stored = await addSupportMessage(ticket.id, "AGENT", replyMessage, env, agentId);
+
+				console.log("[AGENT MESSAGE SENT]", {
+					sessionId: session.id,
+					ticketId: ticket.id,
+					agentId,
+					customerPhone: ticket.customer_phone,
+				});
+
+				return Response.json({ message: stored });
+			} catch (error) {
+				if (error instanceof Error && error.message === "Support ticket not found") {
+					return Response.json({ error: error.message }, { status: 404 });
+				}
+
+				console.error("Agent reply failed:", error);
+				return Response.json({ error: "Could not send agent reply" }, { status: 500 });
+			}
+		}
+
+		if (request.method === "POST" && adminAgentEndMatch) {
+			const sessionId = Number(adminAgentEndMatch[1]);
+			let body: AgentEndRequest;
+			try {
+				body = await request.json() as AgentEndRequest;
+			} catch {
+				return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
+			}
+
+			const agentId = body.agentId?.trim();
+			if (!agentId) {
+				return Response.json({ error: "agentId is required" }, { status: 400 });
+			}
+			if (!isValidAgentId(agentId)) {
+				return Response.json(
+					{ error: "agentId must be a short identifier (name or code), not a message" },
+					{ status: 400 }
+				);
+			}
+
+			try {
+				const session = await getSupportAgentSession(sessionId, env);
+				if (!session || session.status !== "ACTIVE") {
+					return Response.json({ error: "No active agent session was found" }, { status: 409 });
+				}
+
+				if (session.agent_id !== agentId) {
+					return Response.json({ error: "This session is assigned to a different agent" }, { status: 403 });
+				}
+
+				const closed = await closeSupportAgentSession(sessionId, env);
+				const ticket = await updateSupportTicketStatus(session.ticket_id, "CLOSED", env);
+
+				console.log("[AGENT SESSION CLOSED]", {
+					sessionId: session.id,
+					ticketId: ticket.id,
+					agentId,
+				});
+
+				await sendWhatsAppMessage(
+					ticket.customer_phone,
+					[
+						"Your conversation with the support agent has ended.",
+						"",
+						`Ticket: ${ticket.ticket_number}`,
+						"",
+						"If you need more help, you can start a new support request.",
+					].join("\n"),
+					env
+				);
+
+				return Response.json({ session: closed, ticket });
+			} catch (error) {
+				if (error instanceof Error && error.message === "Support ticket not found") {
+					return Response.json({ error: error.message }, { status: 404 });
+				}
+
+				console.error("Agent session end failed:", error);
+				return Response.json({ error: "Could not end agent session" }, { status: 500 });
+			}
+		}
 
 		/*
 		|--------------------------------------------------------------------------
@@ -2167,11 +5556,75 @@ if (
 			url.pathname ===
 				"/razorpay-webhook"
 		) {
-			console.log("[ROUTE] POST /razorpay-webhook");
+			console.log("[ROUTE] POST /razorpay-webhook — webhook received");
 			const rawBody = await request.text();
 			const signature = request.headers.get("x-razorpay-signature") ?? "";
+			console.log("[RAZORPAY WEBHOOK] has x-razorpay-signature header:", Boolean(request.headers.get("x-razorpay-signature")));
 			const result = await handleRazorpaySuccessWebhook(rawBody, signature, env);
 			console.log("[RETURN] POST /razorpay-webhook delegated", result);
+
+			if (result.ok && result.orderId && result.customerPhone) {
+				const delivery = await ensurePendingOrderDelivery(result.orderId, env);
+				if (delivery.delivery_status === "PENDING_DETAILS") {
+					if (delivery.customer_response === "NO") {
+						await ensureDeliveryFollowUp(result.orderId, result.customerPhone, env);
+					} else {
+						const conversation = await getConversationState(result.customerPhone, env);
+						const context = conversation?.context ?? {};
+						const activeOrderId = Number(context.order_id);
+						const isSameDeliveryConversation =
+							conversation?.state === "DELIVERY_DETAILS" &&
+							activeOrderId === result.orderId;
+
+						if (!isSameDeliveryConversation) {
+							if (
+								conversation?.state === "DELIVERY_DETAILS" &&
+								Number.isSafeInteger(activeOrderId) &&
+								activeOrderId > 0
+							) {
+								const interruptedDelivery = await getOrderDeliveryDetails(activeOrderId, env);
+								if (interruptedDelivery?.delivery_status === "PENDING_DETAILS") {
+									await ensureDeliveryFollowUp(activeOrderId, result.customerPhone, env);
+								}
+							}
+							const step = delivery.customer_response === "YES"
+								? "RECIPIENT_NAME"
+								: "CHOICE";
+							await upsertConversationState(
+								result.customerPhone,
+								"DELIVERY_DETAILS",
+								env,
+								{ source: "PAYMENT_SUCCESS_DELIVERY", order_id: result.orderId, step, delivery: {} },
+								"payment_link.paid"
+							);
+							if (step === "CHOICE") {
+								await sendDeliveryChoicePrompt(
+									result.customerPhone,
+									result.orderId,
+									result.totalAmount ?? 0,
+									env
+								);
+							} else {
+								await sendDeliveryStepPrompt(result.customerPhone, "RECIPIENT_NAME", env);
+							}
+						} else if (context.step === "CHOICE") {
+							await sendDeliveryChoicePrompt(
+								result.customerPhone,
+								result.orderId,
+								result.totalAmount ?? 0,
+								env
+							);
+						}
+					}
+				} else if (!result.alreadyPaid) {
+					await sendWhatsAppMessage(
+						result.customerPhone,
+						`✅ Payment received! Order #${result.orderId} is confirmed. Delivery details are already on file.`,
+						env
+					);
+				}
+			}
+
 			return new Response(result.ok ? "Payment processed" : "Payment not processed", { status: result.ok ? 200 : 400 });
 		}
 
@@ -2236,10 +5689,8 @@ if (
 					crypto.randomUUID()
 				);
 
-			const incomingText =
-				message.text?.body
-					?.trim()
-					.toLowerCase() ?? "";
+			const incomingTextRaw = message.text?.body?.trim() ?? "";
+			const incomingText = incomingTextRaw.toLowerCase();
 
 			const buttonId =
 				message.interactive
@@ -2264,20 +5715,113 @@ if (
 			ctx.waitUntil(
 				(async () => {
 					try {
+						if (await handleDeliveryConversation(sender, incomingTextRaw, buttonId, env)) {
+							console.log("[WEBHOOK BRANCH RETURN] Delivery details conversation");
+							return;
+						}
+
+						if (message.text?.body && await processWaitingAgentCustomerMessage(sender, incomingText, env)) {
+							console.log("[WEBHOOK BRANCH RETURN] Waiting-agent customer message");
+							return;
+						}
+
+							if (message.image) {
+								const activeSession = await getActiveSupportSession(sender, env);
+								const activeTicket = await getLatestCustomerSupportTicket(sender, env);
+								const activeAgentSession = activeTicket
+									? await getActiveOrWaitingAgentSessionForTicket(activeTicket.id, env)
+									: null;
+								if (activeSession && activeTicket && !activeAgentSession && ["DAMAGED_PRODUCT", "REPLACEMENT_REQUEST", "REFUND_REQUEST"].includes(activeSession.issue_type)) {
+									if (!message.image.id) {
+										console.error("[SUPPORT IMAGE] Missing media id for damaged product session");
+										return;
+									}
+
+									await attachSupportSessionMedia(
+										activeSession.id,
+										message.image.id,
+										message.image.url ?? null,
+										message.image.mime_type ?? null,
+										env
+									);
+
+									await updateSupportSession(
+										activeSession.id,
+										{
+											status: "TICKET_CREATED",
+											current_step: "WAITING_USER_DECISION",
+											collected_data: {
+												...(activeSession.collected_data ?? {}),
+												image_id: message.image.id,
+												image_url: message.image.url ?? null,
+											},
+										},
+										env
+									);
+
+									console.log("[SUPPORT IMAGE ATTACHED]", {
+										ticketId: activeTicket.id,
+										ticketNumber: activeTicket.ticket_number,
+										sessionId: activeSession.id,
+									});
+
+									if (activeSession.issue_type === "DAMAGED_PRODUCT") {
+										const troubleshootingQuery = String(
+											activeSession.issue_description ??
+											(activeSession.collected_data as Record<string, unknown> | null)?.issue_description ??
+											activeSession.product_name ??
+											"damaged product"
+										);
+										const troubleshootingContext = await retrieveKnowledgeContext(troubleshootingQuery, env);
+										const troubleshootingAnswer = await generateAnswerFromContext(troubleshootingQuery, troubleshootingContext, env);
+
+										await sendDamagedProductResolutionCheck(
+											sender,
+											[
+												"Thanks for the photo — here's something that might help:",
+												"",
+												troubleshootingAnswer,
+												"",
+												"Did this resolve the issue?",
+											].join("\n"),
+											env
+										);
+										console.log("[WEBHOOK BRANCH RETURN] Support image attached");
+										return;
+									}
+
+									await sendPostImageSupportActions(sender, activeTicket.ticket_number, env);
+										console.log("[SUPPORT POST IMAGE ACTIONS]", {
+											ticketId: activeTicket.id,
+											ticketNumber: activeTicket.ticket_number,
+											phoneNumber: sender,
+										});
+									console.log("[WEBHOOK BRANCH RETURN] Support image attached");
+									return;
+								}
+
+								const imageHandled = await processSupportImageMessage(
+									sender,
+									{
+										id: message.image.id,
+										url: message.image.url,
+									},
+									env
+								);
+
+								if (imageHandled) {
+									console.log("[WEBHOOK BRANCH RETURN] Support image");
+									return;
+								}
+							}
+
 						/*
 						| Welcome menu
 						*/
 
 						if (
-							incomingText === "hi" ||
-							incomingText === "hello" ||
 							incomingText === "start" ||
-							incomingText.startsWith(
-								"hi "
-							) ||
-							incomingText.startsWith(
-								"hello"
-							)
+							isGreetingOnly(incomingText)
 						) {
 							console.log("[WEBHOOK BRANCH] Main menu");
 							await sendMainMenuButtons(
@@ -2342,14 +5886,53 @@ if (
 								{ product_id: productId },
 								`ADD_PRODUCT_${productId}`
 							);
-							await addItemToCart(
+							const addedCart =
+								await addItemToCart(
+									sender,
+									productId,
+									1,
+									env
+								);
+							console.log(
+								"Item added to cart:",
+								{ productId, cartId: addedCart.id }
+							);
+
+							const { items } =
+								await viewCart(sender, env);
+							const addedItem = items.find(
+								(item) => item.product_id === productId
+							);
+							await sendCartActions(
 								sender,
-								productId,
-								1,
+								addedItem?.product_name ?? "Item",
 								env
 							);
 
 							console.log("[WEBHOOK BRANCH RETURN] Product selection");
+							return;
+						}
+
+						/*
+						| Order selected from the list
+						*/
+
+						const selectedOrderMatch =
+							listRowId.match(
+								/^TRACK_ORDER_(\d+)$/
+							);
+
+						if (selectedOrderMatch) {
+							console.log("[WEBHOOK BRANCH] Order selection");
+							const selectedOrderId = Number(selectedOrderMatch[1]);
+
+							await processTrackOrderById(
+								sender,
+								selectedOrderId,
+								env
+							);
+
+							console.log("[WEBHOOK BRANCH RETURN] Order selection");
 							return;
 						}
 
@@ -2464,14 +6047,14 @@ if (
 						}
 
 						/*
-						| Latest Order
+						| Track Order (order selection list)
 						*/
 
 						if (
 							buttonId ===
 							"TRACK_ORDER"
 						) {
-							console.log("[WEBHOOK BRANCH] Latest order");
+							console.log("[WEBHOOK BRANCH] Order selection list");
 							await upsertConversationState(
 								sender,
 								"TRACK_ORDER",
@@ -2479,12 +6062,12 @@ if (
 								{ source: "TRACK_ORDER" },
 								buttonId
 							);
-							await processLatestOrder(
+							await sendOrderSelectionList(
 								sender,
 								env
 							);
 
-							console.log("[WEBHOOK BRANCH RETURN] Latest order");
+							console.log("[WEBHOOK BRANCH RETURN] Order selection list");
 							return;
 						}
 
@@ -2501,15 +6084,114 @@ if (
 								{ source: "CUSTOMER_CARE" },
 								buttonId
 							);
-							const answer = await generateCommerceAnswer(
-								"I need customer support and order help.",
-								env,
+							await processSupportRequest(
 								sender,
-								"CUSTOMER_CARE"
+								"customer support",
+								env,
+								"GENERAL_SUPPORT"
 							);
-							await sendWhatsAppMessage(sender, answer, env);
 							return;
 							}
+
+						if (buttonId === "TALK_AGENT") {
+							await sendConnectAgentCta(sender, env);
+							return;
+						}
+
+						if (buttonId === "CONNECT_AGENT") {
+							await sendConnectAgentCta(sender, env);
+							return;
+						}
+
+						if (buttonId === "ISSUE_RESOLVED") {
+							const resolvedTicket = await getLatestCustomerSupportTicket(sender, env);
+							const resolvedSession = await getLatestTicketCreatedSupportSession(sender, env);
+
+							if (!resolvedTicket || !resolvedSession) {
+								await sendWhatsAppMessage(sender, "No active support issue was found to resolve.", env);
+								return;
+							}
+
+							await updateSupportSession(resolvedSession.id, { status: "CLOSED" }, env);
+							const closedTicket = await updateSupportTicketStatus(resolvedTicket.id, "RESOLVED", env);
+
+							console.log("[SUPPORT SELF RESOLVED]", {
+								ticketId: closedTicket.id,
+								ticketNumber: closedTicket.ticket_number,
+								issueType: resolvedSession.issue_type,
+							});
+
+							await sendWhatsAppMessage(
+								sender,
+								[
+									"✅ Great, glad that helped!",
+									"",
+									`Ticket ${closedTicket.ticket_number} has been marked resolved.`,
+									"",
+									"If you need anything else, just send a message.",
+								].join("\n"),
+								env
+							);
+							return;
+						}
+
+						if (buttonId === "TRACK_TICKET") {
+							await processSupportTicketStatusRequest(sender, env);
+							return;
+						}
+
+						if (buttonId === "CANCEL_REQUEST") {
+							const ticket = await getLatestCustomerSupportTicket(sender, env);
+							if (!ticket) {
+								await sendWhatsAppMessage(sender, "No active support ticket was found.", env);
+								return;
+							}
+
+							const closedTicket = await updateSupportTicketStatus(ticket.id, "CLOSED", env);
+							await sendWhatsAppMessage(sender, `✅ Request cancelled. Ticket ${closedTicket.ticket_number} is closed.`, env);
+							return;
+						}
+
+						if (buttonId === "END_CHAT") {
+							const ticket = await getLatestCustomerSupportTicket(sender, env);
+							const agentSession = ticket
+								? await getActiveOrWaitingAgentSessionForTicket(ticket.id, env)
+								: null;
+
+							if (!ticket || !agentSession) {
+								await sendWhatsAppMessage(sender, "No active support-agent chat was found.", env);
+								return;
+							}
+
+							const previousSessionStatus = agentSession.status;
+							await closeWaitingAgentTicket(
+								sender,
+								ticket,
+								env,
+								[
+									"✅ Support chat ended",
+									"",
+									`Ticket: ${ticket.ticket_number}`,
+									"",
+									"Your conversation has been closed.",
+									"",
+									"If you need more help, you can start a new support request.",
+								].join("\n")
+							);
+
+							console.log("[CUSTOMER END CHAT]", {
+								sessionId: agentSession.id,
+								ticketId: ticket.id,
+								ticketNumber: ticket.ticket_number,
+								previousSessionStatus,
+							});
+							return;
+						}
+
+						if (buttonId === "NO_THANKS") {
+							await sendWhatsAppMessage(sender, "Understood. Your support ticket remains open.", env);
+							return;
+						}
 
 
 						/*
@@ -2536,6 +6218,158 @@ if (
 
 							console.log("[WEBHOOK BRANCH RETURN] Track order by ID");
 							return;
+						}
+
+						/*
+						| Order status intent (free text)
+						*/
+
+						const isOrderStatusIntent =
+							(/\border\b/.test(incomingText) &&
+								/\b(status|placed|where|track|arriving|arrived|delivered|shipped)\b/.test(
+									incomingText
+								)) ||
+							(/\bpayment\b/.test(incomingText) &&
+								/\b(received|status|done|complete|completed|successful|confirmed)\b/.test(
+									incomingText
+								));
+
+						if (isOrderStatusIntent) {
+							console.log("[WEBHOOK BRANCH] Order status intent");
+							await upsertConversationState(
+								sender,
+								"TRACK_ORDER",
+								env,
+								{ source: "ORDER_STATUS_INTENT" },
+								incomingText
+							);
+							await processLatestOrder(
+								sender,
+								env
+							);
+
+							console.log("[WEBHOOK BRANCH RETURN] Order status intent");
+							return;
+						}
+
+						/*
+						| Explicit ticket-append intent (only when the customer
+						| clearly wants to add information to an existing
+						| ticket — not merely because a ticket happens to be
+						| OPEN, so commerce/order questions stay routable).
+						*/
+
+						if (incomingText && hasExplicitTicketAppendIntent(incomingText) && await processSupportTextMessage(sender, incomingText, env)) {
+							console.log("[WEBHOOK BRANCH RETURN] Support text reply");
+							return;
+						}
+
+						/*
+						| Support ticket status intent
+						*/
+
+						if (isSupportStatusIntent(incomingText)) {
+							console.log("[WEBHOOK BRANCH] Support ticket status");
+							await upsertConversationState(
+								sender,
+								"CUSTOMER_CARE",
+								env,
+								{ source: "SUPPORT_TICKET_STATUS" },
+								incomingText
+							);
+							await processSupportTicketStatusRequest(sender, env);
+
+							console.log("[WEBHOOK BRANCH RETURN] Support ticket status");
+							return;
+						}
+
+						if (incomingText && isSupportIntent(incomingText)) {
+							const priorityIssueType = resolveSupportIssueType(incomingText);
+							if (["DAMAGED_PRODUCT", "REPLACEMENT_REQUEST", "REFUND_REQUEST"].includes(priorityIssueType)) {
+								await createImmediateSupportTicket(sender, incomingText, priorityIssueType, env);
+								console.log("[WEBHOOK BRANCH RETURN] Support-priority ticket");
+								return;
+							}
+						}
+
+						if (incomingText && await getActiveSupportSession(sender, env)) {
+							const activeSession = await getActiveSupportSession(sender, env);
+							if (activeSession && activeSession.issue_type === "DAMAGED_PRODUCT") {
+								const handled = await handleDamagedProductSupportConversation(sender, incomingText, env, activeSession);
+								if (handled) {
+									console.log("[WEBHOOK BRANCH RETURN] Damaged product session text");
+									return;
+								}
+							}
+						}
+
+						if (incomingText && isNaturalAgentRequest(incomingText)) {
+							await sendConnectAgentCta(sender, env);
+							console.log("[WEBHOOK BRANCH RETURN] Natural-language agent handoff");
+							return;
+						}
+
+						/*
+						| Support ticket intent
+						*/
+
+						if (isSupportIntent(incomingText)) {
+							const issueType = resolveSupportIssueType(incomingText);
+							console.log("[SUPPORT INTENT DETECTED]", {
+								message: incomingText,
+								issueType,
+							});
+							console.log("[SUPPORT ISSUE TYPE]", issueType);
+
+							if (
+								issueType === "DAMAGED_PRODUCT" ||
+								issueType === "REPLACEMENT_REQUEST" ||
+								issueType === "REFUND_REQUEST"
+							) {
+								await createImmediateSupportTicket(sender, incomingText, issueType, env);
+								console.log("[WEBHOOK BRANCH RETURN] Damaged product support session");
+								return;
+							}
+
+							console.log("[WEBHOOK BRANCH] Support ticket");
+							await upsertConversationState(
+								sender,
+								"CUSTOMER_CARE",
+								env,
+								{ source: "SUPPORT_TICKET", issue_type: issueType },
+								incomingText
+							);
+							await processSupportRequest(sender, incomingText, env);
+
+							console.log("[WEBHOOK BRANCH RETURN] Support ticket");
+							return;
+						}
+
+						if (incomingText) {
+							console.log("[AI COMMERCE ROUTER ENTRY]", {
+								sender,
+								message: incomingText,
+							});
+							const commerceReply = await answerCommerceQuestion(sender, incomingText, {
+								AI: env.AI,
+								SUPABASE_URL: env.SUPABASE_URL,
+								SUPABASE_SERVICE_ROLE_KEY: env.SUPABASE_SERVICE_ROLE_KEY,
+								SUPABASE_ANON_KEY: env.SUPABASE_ANON_KEY,
+								OPENAI_API_KEY: env.OPENAI_API_KEY,
+								OPENAI_CHAT_MODEL: env.OPENAI_CHAT_MODEL,
+								RAG_MATCH_THRESHOLD: env.RAG_MATCH_THRESHOLD,
+							});
+
+							if (commerceReply) {
+								await sendWhatsAppMessage(sender, commerceReply, env);
+								console.log("[WEBHOOK BRANCH RETURN] AI commerce response");
+								return;
+							}
+
+							console.log("[AI COMMERCE ROUTER SKIPPED]", {
+								sender,
+								reason: "UNKNOWN_COMMERCE_INTENT",
+							});
 						}
 
 						/*
@@ -2589,6 +6423,9 @@ if (incomingText) {
 				SUPABASE_URL: env.SUPABASE_URL,
 				SUPABASE_SERVICE_ROLE_KEY: env.SUPABASE_SERVICE_ROLE_KEY,
 				SUPABASE_ANON_KEY: env.SUPABASE_ANON_KEY,
+				OPENAI_API_KEY: env.OPENAI_API_KEY,
+				OPENAI_CHAT_MODEL: env.OPENAI_CHAT_MODEL,
+				RAG_MATCH_THRESHOLD: env.RAG_MATCH_THRESHOLD,
 			}
 		);
 
@@ -2671,10 +6508,62 @@ await sendWhatsAppMessage(
 			);
 		}
 
-		console.log("[RETURN] Unmatched route 200");
-		return new Response(
-			"WhatsApp commerce bot is running.",
-			{ status: 200 }
-		);
-	},
+		
+    console.log("[RETURN] Unmatched route 200");
+    return new Response(
+      "WhatsApp commerce bot is running.",
+      { status: 200 }
+    );
+}
+
+export default {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<Response> {
+    const origin = request.headers.get("Origin");
+    const allowedOrigins = [
+      "http://localhost:5173",
+    ];
+
+    const corsHeaders = new Headers({
+      "Access-Control-Allow-Methods":
+        "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers":
+        "Content-Type, Authorization",
+      "Vary": "Origin",
+    });
+
+    if (origin && allowedOrigins.includes(origin)) {
+      corsHeaders.set(
+        "Access-Control-Allow-Origin",
+        origin
+      );
+    }
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders,
+      });
+    }
+
+    const response = await handleRequest(
+      request,
+      env,
+      ctx
+    );
+
+    const headers = new Headers(response.headers);
+    corsHeaders.forEach((value, key) => {
+      headers.set(key, value);
+    });
+
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  },
 } satisfies ExportedHandler<Env>;
