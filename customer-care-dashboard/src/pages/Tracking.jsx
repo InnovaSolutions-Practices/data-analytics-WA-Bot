@@ -283,7 +283,8 @@ const handleStatusUpdate = async () => {
 
               <div className="status-update-controls">
 
-                <select
+                
+<select
   value={status}
   onChange={(e) => setStatus(e.target.value)}
 >
@@ -291,14 +292,31 @@ const handleStatusUpdate = async () => {
     {statusLabels[selectedOrder.status] || selectedOrder.status}
   </option>
 
-  {(allowedTransitions[selectedOrder.status] || []).map(
-    (nextStatus) => (
-      <option key={nextStatus} value={nextStatus}>
-        {statusLabels[nextStatus] || nextStatus}
-      </option>
-    )
-  )}
+  {(allowedTransitions[
+    String(selectedOrder.status).toUpperCase() === 'PENDING'
+      ? 'pending'
+      : String(selectedOrder.status).toUpperCase() === 'PAYMENT_PENDING'
+        ? 'payment_pending'
+        : String(selectedOrder.status).toUpperCase() === 'PAID'
+          ? 'paid'
+          : String(selectedOrder.status).toUpperCase() === 'FAILED'
+            ? 'failed'
+            : String(selectedOrder.status).toUpperCase() === 'PACKED'
+              ? 'PACKED'
+              : String(selectedOrder.status).toUpperCase() === 'SHIPPED'
+                ? 'SHIPPED'
+                : String(selectedOrder.status).toUpperCase() === 'OUT_FOR_DELIVERY'
+                  ? 'OUT_FOR_DELIVERY'
+                  : String(selectedOrder.status).toUpperCase() === 'DELIVERED'
+                    ? 'DELIVERED'
+                    : String(selectedOrder.status).toLowerCase()
+  ] || []).map((nextStatus) => (
+    <option key={nextStatus} value={nextStatus}>
+      {statusLabels[nextStatus] || nextStatus}
+    </option>
+  ))}
 </select>
+
 
                 <button
   className="update-status-button"
