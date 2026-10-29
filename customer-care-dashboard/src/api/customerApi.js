@@ -152,13 +152,32 @@ export async function getAllConversations() {
     states: Array.isArray(data.states) ? data.states : [],
   }
 }
+
+
 export async function updateOrderStatusApi(orderId, status) {
   const statusMap = {
     Pending: 'pending',
+    'Payment Pending': 'payment_pending',
+    Paid: 'paid',
+    Failed: 'failed',
+    Cancelled: 'cancelled',
+    Fulfilled: 'fulfilled',
     Processing: 'PACKED',
     Shipped: 'SHIPPED',
     'In Transit': 'OUT_FOR_DELIVERY',
     Delivered: 'DELIVERED',
+
+    // Backend status values
+    pending: 'pending',
+    payment_pending: 'payment_pending',
+    paid: 'paid',
+    failed: 'failed',
+    cancelled: 'cancelled',
+    fulfilled: 'fulfilled',
+    PACKED: 'PACKED',
+    SHIPPED: 'SHIPPED',
+    OUT_FOR_DELIVERY: 'OUT_FOR_DELIVERY',
+    DELIVERED: 'DELIVERED',
   }
 
   const apiStatus = statusMap[status]

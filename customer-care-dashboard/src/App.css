@@ -958,7 +958,6 @@
 .cart-page-heading .view-button {
   white-space: nowrap;
 }
-```css
 /* Conversations page */
 .conversations-page {
   min-width: 0;
@@ -1363,7 +1362,6 @@
     flex-direction: column;
   }
 }
-```css
 /* Products page */
 .products-page {
   min-width: 0;
