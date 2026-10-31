@@ -22,6 +22,7 @@ import {
 	createSupportTicket,
 	ensurePendingOrderDelivery,
 	getConversationState,
+	getCustomerDeliveryAddresses,
 	getOrderDeliveryDetails,
 	getActiveOrWaitingAgentSessionForTicket,
 	getActiveSupportSession,
@@ -37,7 +38,8 @@ import {
 	isNegativeAnswer,
 	getSupportTicket,
 	handleRazorpaySuccessWebhook,
-	saveDeliveryAddressForOrder,
+	linkSavedDeliveryAddressToOrder,
+	saveDeliveryAddressForCustomer,
 	setOrderDeliveryResponse,
 	normalizeSupportSessionAnswer,
 	SUPPORT_TICKET_STATUSES,
@@ -47,8 +49,10 @@ import {
 	updateSupportTicketStatus,
 	updateOrderPaymentLink,
 	upsertConversationState,
+	upsertCustomer,
 	viewCart,
 	type OrderStatus,
+	type DeliveryAddressRecord,
 	type SupportAgentSessionRecord,
 	type DeliveryAddressInput,
 	type DeliveryStatus,
@@ -57,6 +61,10 @@ import {
 } from "./commerce";
 import { generateAnswer, generateAnswerFromContext, generateRAGResponse, retrieveKnowledgeContext } from "./rag";
 import { answerCommerceQuestion } from "./ai-commerce-router";
+import {
+	buildDeliveryAddressFlowMessage,
+	parseDeliveryAddressFlowSubmission,
+} from "./whatsapp-flows";
 
 interface Env {
 	AI: Ai;
@@ -66,6 +74,8 @@ interface Env {
 
 	WHATSAPP_TOKEN: string;
 	PHONE_NUMBER_ID: string;
+	WHATSAPP_APP_SECRET?: string;
+	WHATSAPP_DELIVERY_FLOW_ID?: string;
 
 	RAZORPAY_KEY_ID: string;
 	RAZORPAY_KEY_SECRET: string;
@@ -191,9 +201,29 @@ interface AgentEndRequest {
 */
 
 function getAdminClient(env: Env): SupabaseClient {
+	const supabaseUrl = env.SUPABASE_URL?.trim();
+	const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+
+	console.log({
+		hasUrl: Boolean(supabaseUrl),
+		hasServiceKey: Boolean(serviceRoleKey),
+	});
+
+	if (!supabaseUrl || !serviceRoleKey) {
+		throw new Error(
+			"Supabase admin client configuration is missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY."
+		);
+	}
+
+	try {
+		new URL(supabaseUrl);
+	} catch {
+		throw new Error("SUPABASE_URL must be a valid absolute URL.");
+	}
+
 	return createClient(
-		env.SUPABASE_URL,
-		env.SUPABASE_SERVICE_ROLE_KEY,
+		supabaseUrl,
+		serviceRoleKey,
 		{
 			auth: {
 				persistSession: false,
@@ -222,19 +252,183 @@ function getPublicClient(env: Env): SupabaseClient {
 |--------------------------------------------------------------------------
 */
 
+interface WhatsAppSendResult {
+	endpoint: string;
+	httpStatus: number;
+	responseBody: unknown;
+	metaMessageId: string | null;
+}
+
+function maskPhoneNumber(phoneNumber: string): string {
+	const digits = phoneNumber.replace(/\D/g, "");
+	return digits.length > 4
+		? `${"*".repeat(digits.length - 4)}${digits.slice(-4)}`
+		: "****";
+}
+
+function sanitizeWhatsAppLogValue(value: unknown, key = ""): unknown {
+	if (typeof value === "string") {
+		if (["to", "input", "wa_id", "recipient_id"].includes(key)) {
+			return maskPhoneNumber(value);
+		}
+		return value
+			.replace(/(Hi )[^,\n]+(, )/g, "$1<customer>$2")
+			.replace(/(?<!\d)\+?\d[\d\s().-]{6,}\d(?!\d)/g, (phone) =>
+				maskPhoneNumber(phone)
+			);
+	}
+	if (Array.isArray(value)) {
+		return value.map((item) => sanitizeWhatsAppLogValue(item));
+	}
+	if (value && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value).map(([entryKey, entryValue]) => [
+				entryKey,
+				sanitizeWhatsAppLogValue(entryValue, entryKey),
+			])
+		);
+	}
+	return value;
+}
+
+async function recordWhatsAppDeliveryStatuses(body: any, env: Env): Promise<void> {
+	const statuses = (body.entry ?? [])
+		.flatMap((entry: any) => entry.changes ?? [])
+		.flatMap((change: any) => change.value?.statuses ?? []);
+	const client = getAdminClient(env);
+
+	for (const delivery of statuses) {
+		const metaMessageId = String(delivery.id ?? "");
+		const deliveryStatus = String(delivery.status ?? "unknown");
+		const recipient = String(delivery.recipient_id ?? "");
+		const timestamp = delivery.timestamp ? String(delivery.timestamp) : null;
+		const errors = delivery.errors
+			? sanitizeWhatsAppLogValue(delivery.errors)
+			: null;
+
+		console.log("[WHATSAPP_DELIVERY_STATUS]", {
+			metaMessageId: metaMessageId || null,
+			status: deliveryStatus,
+			recipient: maskPhoneNumber(recipient),
+			timestamp,
+			errors,
+		});
+
+		if (!metaMessageId) continue;
+		if (!["sent", "delivered", "read", "failed"].includes(deliveryStatus)) {
+			continue;
+		}
+
+		try {
+			const { data: event, error: lookupError } = await client
+				.from("notification_events")
+				.select("id, payload, status")
+				.contains("payload", { meta_message_id: metaMessageId })
+				.maybeSingle();
+			if (lookupError) throw new Error(lookupError.message);
+			if (!event) {
+				console.log("[WHATSAPP_DELIVERY_STATUS]", {
+					metaMessageId,
+					status: deliveryStatus,
+					eventMatched: false,
+				});
+				continue;
+			}
+
+			const existingPayload =
+					(event.payload as Record<string, unknown> | null) ?? {};
+			const deliveryRank: Record<string, number> = {
+					sent: 1,
+					delivered: 2,
+					read: 3,
+					failed: 4,
+			};
+			const existingDeliveryStatus = String(
+					existingPayload.delivery_status ?? ""
+			);
+			const effectiveStatus =
+					(deliveryRank[existingDeliveryStatus] ?? 0) >
+					(deliveryRank[deliveryStatus] ?? 0)
+						? existingDeliveryStatus
+						: deliveryStatus;
+			const eventStatus =
+					effectiveStatus === "delivered" || effectiveStatus === "read"
+						? "delivered"
+						: effectiveStatus === "sent"
+							? event.status === "queued" ? "sent" : event.status
+							: effectiveStatus === "failed"
+								? "failed"
+								: event.status;
+			/* Status values are monotonic: late "sent" callbacks cannot undo a
+			 * delivered/read result. */
+			const nextPayload = {
+					...existingPayload,
+					delivery_status: effectiveStatus,
+					delivery_status_timestamp:
+						effectiveStatus === deliveryStatus ? timestamp : existingPayload.delivery_status_timestamp,
+					delivery_errors:
+						effectiveStatus === "failed" ? errors : existingPayload.delivery_errors ?? null,
+			};
+			const { error: updateError } = await client
+					.from("notification_events")
+					.update({
+						status: eventStatus,
+						payload: nextPayload,
+						...(effectiveStatus === "failed"
+							? { reason: JSON.stringify(errors ?? "WhatsApp message failed") }
+							: {}),
+					})
+					.eq("id", event.id);
+			if (updateError) throw new Error(updateError.message);
+			console.log("[WHATSAPP_DELIVERY_STATUS]", {
+					metaMessageId,
+					status: deliveryStatus,
+					eventMatched: true,
+					eventUpdated: true,
+			});
+		} catch (error) {
+			console.error("[WHATSAPP_DELIVERY_STATUS_ERROR]", {
+					metaMessageId,
+					status: deliveryStatus,
+					error: sanitizeWhatsAppLogValue(
+						error instanceof Error ? error.message : String(error)
+					),
+			});
+		}
+	}
+
+}
+
+async function verifyWhatsAppWebhookSignature(
+	rawBody: string,
+	signature: string,
+	appSecret: string
+): Promise<boolean> {
+	const suppliedSignature = signature.startsWith("sha256=")
+		? signature.slice("sha256=".length)
+		: "";
+	if (!suppliedSignature) return false;
+
+	const key = await crypto.subtle.importKey(
+		"raw",
+		new TextEncoder().encode(appSecret),
+		{ name: "HMAC", hash: "SHA-256" },
+		false,
+		["sign"]
+	);
+	const digest = await crypto.subtle.sign(
+		"HMAC",
+		key,
+		new TextEncoder().encode(rawBody)
+	);
+	return safeCompare(bytesToHex(digest), suppliedSignature.toLowerCase());
+}
+
 async function sendWhatsAppPayload(
 	payload: Record<string, unknown>,
 	env: Env
-): Promise<void> {
-	const apiUrl =
-		`https://graph.facebook.com/v21.0/${env.PHONE_NUMBER_ID}/messages`;
-
-	console.log("PHONE_NUMBER_ID:", env.PHONE_NUMBER_ID);
-	console.log("WhatsApp API URL:", apiUrl);
-	console.log(
-		"Outgoing WhatsApp Payload:",
-		JSON.stringify(payload, null, 2)
-	);
+): Promise<WhatsAppSendResult> {
+	const apiUrl = `https://graph.facebook.com/v21.0/${env.PHONE_NUMBER_ID}/messages`;
 
 	const response = await fetch(apiUrl, {
 		method: "POST",
@@ -245,34 +439,53 @@ async function sendWhatsAppPayload(
 		body: JSON.stringify(payload),
 	});
 
-	const result = await response.text();
-
-	console.log("Meta Response:", response.status, result);
+	const responseBody = await response.text();
+	let responseData: Record<string, unknown> | null = null;
+	try {
+		responseData = JSON.parse(responseBody) as Record<string, unknown>;
+	} catch {
+		// Keep the raw response text for the diagnostic log.
+	}
+	const responseMessages = responseData?.messages as Array<{ id?: string }> | undefined;
+	const recipient = typeof payload.to === "string" ? payload.to : "";
+	const result: WhatsAppSendResult = {
+		endpoint: apiUrl,
+		httpStatus: response.status,
+		responseBody: responseData
+			? sanitizeWhatsAppLogValue(responseData)
+			: recipient
+				? responseBody.replaceAll(recipient, maskPhoneNumber(recipient))
+				: responseBody,
+		metaMessageId: responseMessages?.[0]?.id ?? null,
+	};
+	console.log("[WHATSAPP_API_RESPONSE]", {
+		...result,
+		recipient: maskPhoneNumber(recipient),
+		payload: sanitizeWhatsAppLogValue(payload),
+	});
 
 	if (!response.ok) {
-		console.error(
-			"WhatsApp API failed:",
-			response.status,
-			result
-		);
-
 		throw new Error(
-			`WhatsApp API request failed with status ${response.status}`
+			JSON.stringify({
+				error: "WhatsApp API request rejected",
+				endpoint: result.endpoint,
+				httpStatus: result.httpStatus,
+				responseBody: result.responseBody,
+				metaMessageId: result.metaMessageId,
+				recipient: maskPhoneNumber(recipient),
+				payload: sanitizeWhatsAppLogValue(payload),
+			})
 		);
 	}
-
-	console.log(
-		"WhatsApp API request succeeded:",
-		result
-	);
+	return result;
 }
 
 async function sendWhatsAppMessage(
 	to: string,
 	message: string,
 	env: Env
-): Promise<void> {
-	await sendWhatsAppPayload(
+): Promise<WhatsAppSendResult> {
+	return sendWhatsAppPayload(
 		{
 			messaging_product: "whatsapp",
 			recipient_type: "individual",
@@ -289,6 +502,11 @@ async function sendWhatsAppMessage(
 
 type DeliveryCollectionStep =
 	| "CHOICE"
+	| "ADDRESS_CHOICE"
+	| "ADDRESS_FORM"
+	| "ADDRESS_CONFIRM"
+	| "FLOW_WAIT"
+	| "FLOW_SAVED"
 	| "RECIPIENT_NAME"
 	| "RECIPIENT_PHONE"
 	| "EMAIL"
@@ -299,19 +517,7 @@ type DeliveryCollectionStep =
 	| "PINCODE"
 	| "LANDMARK";
 
-const DELIVERY_STEP_PROMPTS: Record<Exclude<DeliveryCollectionStep, "CHOICE">, string> = {
-	RECIPIENT_NAME: "Please enter the recipient's name.",
-	RECIPIENT_PHONE: "Please enter the recipient's phone number, including country code.",
-	EMAIL: "Enter an email address, or reply SKIP if you do not want to provide one.",
-	ADDRESS_LINE_1: "Enter the delivery address (house or building and street).",
-	ADDRESS_LINE_2: "Enter an apartment or second address line, or reply SKIP.",
-	CITY: "Which city should we deliver to?",
-	STATE: "Which state should we deliver to?",
-	PINCODE: "Enter the 6-digit delivery pincode.",
-	LANDMARK: "Enter a nearby landmark, or reply SKIP.",
-};
-
-const DELIVERY_STEP_ORDER: readonly Exclude<DeliveryCollectionStep, "CHOICE">[] = [
+const DELIVERY_STEP_ORDER: readonly string[] = [
 	"RECIPIENT_NAME",
 	"RECIPIENT_PHONE",
 	"EMAIL",
@@ -322,6 +528,54 @@ const DELIVERY_STEP_ORDER: readonly Exclude<DeliveryCollectionStep, "CHOICE">[] 
 	"PINCODE",
 	"LANDMARK",
 ];
+
+function formatDeliveryAddress(address: Partial<DeliveryAddressInput>): string {
+	return [
+		address.recipient_name && `Name: ${address.recipient_name}`,
+		address.recipient_phone && `Phone: ${address.recipient_phone}`,
+		address.email && `Email: ${address.email}`,
+		address.address_line_1 && `Address: ${address.address_line_1}`,
+		address.address_line_2 && `Address Line 2: ${address.address_line_2}`,
+		address.city && `City: ${address.city}`,
+		address.state && `State: ${address.state}`,
+		address.pincode && `Pincode: ${address.pincode}`,
+		address.landmark && `Landmark: ${address.landmark}`,
+	].filter((line): line is string => Boolean(line)).join("\n");
+}
+
+async function sendDeliveryAddressChoicePrompt(
+	to: string,
+	address: DeliveryAddressRecord,
+	env: Env
+): Promise<void> {
+	await sendWhatsAppPayload(
+		{
+			messaging_product: "whatsapp",
+			recipient_type: "individual",
+			to,
+			type: "interactive",
+			interactive: {
+				type: "button",
+				body: {
+					text: [
+						"A saved delivery address is available:",
+						"",
+						formatDeliveryAddress(address),
+						"",
+						"Use this address or add a new one?",
+					].join("\n"),
+				},
+				action: {
+					buttons: [
+						{ type: "reply", reply: { id: "DELIVERY_USE_EXISTING", title: "Use Existing Address" } },
+						{ type: "reply", reply: { id: "DELIVERY_ADD_NEW", title: "Add New Address" } },
+					],
+				},
+			},
+		},
+		env
+	);
+}
 
 async function sendDeliveryChoicePrompt(
 	to: string,
@@ -393,31 +647,7 @@ async function ensureDeliveryFollowUp(
 	);
 }
 
-function readDeliveryAddressDraft(value: unknown): Partial<DeliveryAddressInput> {
-	if (!value || typeof value !== "object" || Array.isArray(value)) {
-		return {};
-	}
-	return value as Partial<DeliveryAddressInput>;
-}
-
-async function sendDeliveryStepPrompt(
-	to: string,
-	step: DeliveryCollectionStep,
-	env: Env,
-	prefix?: string
-): Promise<void> {
-	if (step === "CHOICE") {
-		await sendWhatsAppMessage(to, prefix ?? "Please choose Yes or No to continue.", env);
-		return;
-	}
-	await sendWhatsAppMessage(
-		to,
-		[prefix, DELIVERY_STEP_PROMPTS[step]].filter(Boolean).join("\n\n"),
-		env
-	);
-}
-
-async function handleDeliveryConversation(
+async function handleLegacyDeliveryConversation(
 	sender: string,
 	incomingText: string,
 	buttonId: string,
@@ -429,265 +659,752 @@ async function handleDeliveryConversation(
 	}
 
 	const context = conversation.context ?? {};
+	if (context.step !== "CHOICE") {
+		throw new Error("Text-based delivery address collection is disabled; launch the WhatsApp Flow");
+	}
 	const orderId = Number(context.order_id);
-	const step = context.step as DeliveryCollectionStep;
-	if (!Number.isSafeInteger(orderId) || orderId <= 0 || !(step in DELIVERY_STEP_PROMPTS || step === "CHOICE")) {
-		throw new Error(`Invalid persisted delivery conversation state for ${sender}`);
+	if (!Number.isSafeInteger(orderId) || orderId <= 0) {
+		throw new Error(`Invalid persisted delivery order for ${sender}`);
 	}
 
-	const delivery = readDeliveryAddressDraft(context.delivery);
 	const answer = incomingText.trim();
 	if (!answer && !buttonId) {
-		await sendDeliveryStepPrompt(sender, step, env);
+		await sendWhatsAppMessage(sender, "Please choose Yes or No to continue.", env);
 		return true;
 	}
 
-	if (step === "CHOICE") {
-		const choice = buttonId === "DELIVERY_DETAILS_YES" || /^(yes|y|yeah|yep)$/i.test(answer)
-			? "YES"
-			: buttonId === "DELIVERY_DETAILS_NO" || /^(no|n|nope)$/i.test(answer)
-				? "NO"
-				: null;
+	const choice = buttonId === "DELIVERY_DETAILS_YES" || /^(yes|y|yeah|yep)$/i.test(answer)
+		? "YES"
+		: buttonId === "DELIVERY_DETAILS_NO" || /^(no|n|nope)$/i.test(answer)
+			? "NO"
+			: null;
+	if (!choice) {
+		await sendWhatsAppMessage(sender, "Please choose Yes or No to continue.", env);
+		return true;
+	}
 
-		if (!choice) {
-			await sendDeliveryStepPrompt(sender, "CHOICE", env);
-			return true;
+	await setOrderDeliveryResponse(orderId, choice, env);
+	if (choice === "NO") {
+		const { data: order, error } = await getAdminClient(env)
+			.from("orders")
+			.select("customer_phone")
+			.eq("id", orderId)
+			.eq("customer_phone", sender)
+			.maybeSingle();
+		if (error || !order) {
+			throw new Error(`Delivery follow-up order lookup failed: ${error?.message ?? "Order not found for this customer"}`);
 		}
 
-		await setOrderDeliveryResponse(orderId, choice, env);
-		if (choice === "NO") {
-			const { data: order, error } = await getAdminClient(env)
-				.from("orders")
-				.select("customer_phone")
-				.eq("id", orderId)
-				.eq("customer_phone", sender)
-				.maybeSingle();
-			if (error || !order) {
-				throw new Error(`Delivery follow-up order lookup failed: ${error?.message ?? "Order not found for this customer"}`);
-			}
+		const ticket = await ensureDeliveryFollowUp(orderId, sender, env);
+		await upsertConversationState(sender, "MAIN_MENU", env, {}, answer || buttonId);
+		await sendWhatsAppMessage(
+			sender,
+			[
+				"Thank you. Our customer care team will contact you shortly to collect delivery details and schedule the delivery.",
+				"",
+				`Follow-up reference: ${ticket.ticket_number}`,
+			].join("\n"),
+			env
+		);
+		return true;
+	}
 
-			const ticket = await ensureDeliveryFollowUp(orderId, sender, env);
-			await upsertConversationState(sender, "MAIN_MENU", env, {}, answer || buttonId);
-			await sendWhatsAppMessage(
-				sender,
-				[
-					"Thank you. Our customer care team will contact you shortly to collect delivery details and schedule the delivery.",
-					"",
-					`Follow-up reference: ${ticket.ticket_number}`,
-				].join("\n"),
-				env
-			);
-			return true;
-		}
+	await sendAddressOptionsForOrder(sender, orderId, env);
+	return true;
+}
 
-		const firstStep = DELIVERY_STEP_ORDER[0];
+function choosePreferredDeliveryAddress(
+	addresses: DeliveryAddressRecord[]
+): DeliveryAddressRecord | null {
+	const activeAddresses = addresses.filter((address) => address.is_active !== false);
+	return activeAddresses.find((address) => address.is_default) ?? activeAddresses[0] ?? null;
+}
+
+async function sendAddressOptionsForOrder(
+	sender: string,
+	orderId: number,
+	env: Env
+): Promise<void> {
+	const { data: order, error } = await getAdminClient(env)
+		.from("orders")
+		.select("customer_id, customer_phone")
+		.eq("id", orderId)
+		.eq("customer_phone", sender)
+		.maybeSingle();
+	if (error || !order) {
+		throw new Error(`Delivery order lookup failed: ${error?.message ?? "Order not found for this customer"}`);
+	}
+
+	const customer = order.customer_id
+		? null
+		: await upsertCustomer(String(order.customer_phone), env);
+	const customerId = Number(order.customer_id ?? customer?.id);
+	const address = choosePreferredDeliveryAddress(
+		await getCustomerDeliveryAddresses(customerId, env)
+	);
+	const context = {
+		source: "PAYMENT_SUCCESS_DELIVERY",
+		order_id: orderId,
+		customer_id: customerId,
+	};
+
+	if (address) {
 		await upsertConversationState(
 			sender,
 			"DELIVERY_DETAILS",
 			env,
-			{ source: "PAYMENT_SUCCESS_DELIVERY", order_id: orderId, step: firstStep, delivery },
-			answer || buttonId
+			{ ...context, step: "ADDRESS_CHOICE", address_id: address.id },
+			"yes"
 		);
-		await sendDeliveryStepPrompt(sender, firstStep, env);
-		return true;
+		await sendDeliveryAddressChoicePrompt(sender, address, env);
+		return;
 	}
 
-	const currentIndex = DELIVERY_STEP_ORDER.indexOf(step as Exclude<DeliveryCollectionStep, "CHOICE">);
-	if (currentIndex < 0) {
-		throw new Error(`Unsupported delivery collection step: ${String(step)}`);
-	}
-	const nextStep = DELIVERY_STEP_ORDER[currentIndex + 1];
-	const skip = /^(skip|none|no|n\/a)$/i.test(answer);
-	const nextDelivery: Partial<DeliveryAddressInput> = { ...delivery };
-	let fieldError: string | null = null;
+	await upsertConversationState(
+		sender,
+		"DELIVERY_DETAILS",
+		env,
+		{ ...context, step: "FLOW_WAIT" },
+		"yes"
+	);
+	await sendDeliveryFlowPrompt(sender, context, env);
+}
 
-	switch (step) {
-		case "RECIPIENT_NAME":
-			if (!answer.trim() || answer.length > 100) fieldError = "Please enter a recipient name up to 100 characters.";
-			else nextDelivery.recipient_name = answer;
-			break;
-		case "RECIPIENT_PHONE": {
-			const phone = answer.replace(/\D/g, "");
-			if (phone.length < 8 || phone.length > 15) fieldError = "Enter a valid phone number containing 8 to 15 digits.";
-			else nextDelivery.recipient_phone = phone;
-			break;
-		}
-		case "EMAIL":
-			if (skip) nextDelivery.email = null;
-			else if (answer.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(answer)) fieldError = "Enter a valid email address, or reply SKIP.";
-			else nextDelivery.email = answer;
-			break;
-		case "ADDRESS_LINE_1":
-			if (!answer.trim() || answer.length > 500) fieldError = "Please enter an address up to 500 characters.";
-			else nextDelivery.address_line_1 = answer;
-			break;
-		case "ADDRESS_LINE_2":
-			if (!skip && answer.length > 500) fieldError = "The second address line must be 500 characters or fewer, or reply SKIP.";
-			else nextDelivery.address_line_2 = skip ? null : answer;
-			break;
-		case "CITY":
-			if (!answer.trim() || answer.length > 100) fieldError = "Please enter a city up to 100 characters.";
-			else nextDelivery.city = answer;
-			break;
-		case "STATE":
-			if (!answer.trim() || answer.length > 100) fieldError = "Please enter a state up to 100 characters.";
-			else nextDelivery.state = answer;
-			break;
-		case "PINCODE":
-			if (!/^\d{6}$/.test(answer)) fieldError = "Pincode must contain exactly 6 digits.";
-			else nextDelivery.pincode = answer;
-			break;
-		case "LANDMARK":
-			if (!skip && answer.length > 200) fieldError = "The landmark must be 200 characters or fewer, or reply SKIP.";
-			else nextDelivery.landmark = skip ? null : answer;
-			break;
+async function startCheckoutAddressCollection(
+	sender: string,
+	messageId: string,
+	env: Env
+): Promise<void> {
+	const { items } = await viewCart(sender, env);
+	if (!items.length) {
+		await sendWhatsAppMessage(sender, "Your cart is empty. Select View Products to add items.", env);
+		return;
 	}
 
-	if (fieldError) {
-		await sendDeliveryStepPrompt(sender, step, env, fieldError);
-		return true;
-	}
+	const customer = await upsertCustomer(sender, env);
+	const address = choosePreferredDeliveryAddress(
+		await getCustomerDeliveryAddresses(customer.id, env)
+	);
+	const context = {
+		source: "CHECKOUT_DELIVERY",
+		customer_id: customer.id,
+		cart_checkout: true,
+		checkout_message_id: messageId,
+	};
 
-	if (nextStep) {
+	if (address) {
 		await upsertConversationState(
 			sender,
 			"DELIVERY_DETAILS",
 			env,
-			{ source: "PAYMENT_SUCCESS_DELIVERY", order_id: orderId, step: nextStep, delivery: nextDelivery },
-			answer
+			{ ...context, step: "ADDRESS_CHOICE", address_id: address.id },
+			messageId
 		);
-		await sendDeliveryStepPrompt(sender, nextStep, env);
-		return true;
+		await sendDeliveryAddressChoicePrompt(sender, address, env);
+		return;
 	}
 
-	const saved = await saveDeliveryAddressForOrder(orderId, sender, nextDelivery as DeliveryAddressInput, env);
-	await upsertConversationState(sender, "MAIN_MENU", env, {}, answer);
+	await upsertConversationState(
+		sender,
+		"DELIVERY_DETAILS",
+		env,
+		{ ...context, step: "FLOW_WAIT" },
+		messageId
+	);
+	await sendDeliveryFlowPrompt(sender, context, env);
+}
+
+async function sendDeliveryFlowPrompt(
+	sender: string,
+	context: Record<string, unknown>,
+	env: Env
+): Promise<void> {
+	const flowId = env.WHATSAPP_DELIVERY_FLOW_ID?.trim();
+	if (!flowId) {
+		console.error("[FLOW] Flow not configured", {
+			recipient: maskPhoneNumber(sender),
+		});
+		await leaveFlowUnavailableState(sender, context, env);
+		await sendWhatsAppMessage(
+			sender,
+			"Delivery Address Flow is not configured right now. Please try again later.",
+			env
+		);
+		throw new Error("Flow not configured");
+	}
+
+	const payload = buildDeliveryAddressFlowMessage(sender, flowId, crypto.randomUUID());
+	console.log("[FLOW] Launching delivery address flow", {
+		recipient: maskPhoneNumber(sender),
+	});
+	console.log("[FLOW] Flow ID:", flowId);
+	console.log("[FLOW] Payload sent to Meta:", JSON.stringify({
+		...payload,
+		to: maskPhoneNumber(sender),
+	}));
+
+	try {
+		const result = await sendWhatsAppPayload(payload, env);
+		console.log("[FLOW] WhatsApp response:", {
+			endpoint: result.endpoint,
+			httpStatus: result.httpStatus,
+			responseBody: result.responseBody,
+			metaMessageId: result.metaMessageId,
+		});
+	} catch (error) {
+		console.error("[FLOW] WhatsApp response:", {
+			error: error instanceof Error ? error.message : String(error),
+			recipient: maskPhoneNumber(sender),
+		});
+		await leaveFlowUnavailableState(sender, context, env);
+		await sendWhatsAppMessage(
+			sender,
+			"Delivery Address Flow could not be opened. Please try again later.",
+			env
+		);
+		throw error;
+	}
+}
+
+async function leaveFlowUnavailableState(
+	sender: string,
+	context: Record<string, unknown>,
+	env: Env
+): Promise<void> {
+	const savedAddressId = Number(context.address_id);
+	if (Number.isSafeInteger(savedAddressId) && savedAddressId > 0) {
+		await upsertConversationState(
+			sender,
+			"DELIVERY_DETAILS",
+			env,
+			{ ...context, step: "ADDRESS_CHOICE" },
+			"flow_unavailable"
+		);
+		return;
+	}
+	await upsertConversationState(sender, "MAIN_MENU", env, {}, "flow_unavailable");
+}
+
+async function finishCheckoutWithDeliveryAddress(
+	sender: string,
+	messageId: string,
+	addressId: number,
+	env: Env
+): Promise<void> {
+	const { order } = await createOrderFromCart(sender, env, messageId);
+	await ensurePendingOrderDelivery(order.id, env);
+	const { address } = await linkSavedDeliveryAddressToOrder(order.id, sender, addressId, env);
+
+	const paymentLink = await createCommercePaymentLink(order, env);
+	await updateOrderPaymentLink(order.id, paymentLink.id, paymentLink.short_url, env);
+	await upsertConversationState(sender, "MAIN_MENU", env, {}, messageId);
 	await sendWhatsAppMessage(
 		sender,
 		[
-			`✅ Delivery details saved for order #${orderId}.`,
-			`Recipient: ${saved.address.recipient_name}`,
-			`Delivery status: ${saved.delivery.delivery_status}.`,
+			"🧾 Order created",
 			"",
-			"You can add another delivery location with a future order.",
+			`Order: #${order.id}`,
+			"",
+			"Delivery address confirmed:",
+			formatDeliveryAddress(address),
+			"",
+			"Complete your payment:",
+			paymentLink.short_url,
+		].join("\n"),
+		env
+	);
+}
+
+async function startDeliveryAddressFlow(
+	sender: string,
+	context: Record<string, unknown>,
+	messageId: string,
+	env: Env
+): Promise<void> {
+	const flowContext = { ...context, step: "FLOW_WAIT", delivery: {} };
+	await upsertConversationState(
+		sender,
+		"DELIVERY_DETAILS",
+		env,
+		flowContext,
+		messageId
+	);
+	await sendDeliveryFlowPrompt(sender, flowContext, env);
+}
+
+async function handleDeliveryFlowSubmission(
+	sender: string,
+	responseJson: string,
+	env: Env,
+	messageId: string
+): Promise<boolean> {
+	const conversation = await getConversationState(sender, env);
+	if (!conversation || conversation.state !== "DELIVERY_DETAILS") {
+		console.warn("[WHATSAPP_FLOW_SUBMISSION_IGNORED]", {
+			reason: "No active delivery address Flow conversation",
+			recipient: maskPhoneNumber(sender),
+		});
+		return true;
+	}
+
+	const context = conversation.context ?? {};
+	if (context.step === "FLOW_SAVED") {
+		console.info("[WHATSAPP_FLOW_SUBMISSION_IGNORED]", {
+			reason: "Flow submission was already persisted",
+			recipient: maskPhoneNumber(sender),
+		});
+		return true;
+	}
+	if (context.step !== "FLOW_WAIT") {
+		console.warn("[WHATSAPP_FLOW_SUBMISSION_IGNORED]", {
+			reason: "Delivery conversation is not waiting for a Flow submission",
+			recipient: maskPhoneNumber(sender),
+		});
+		return true;
+	}
+
+	let address: DeliveryAddressInput;
+	try {
+		address = parseDeliveryAddressFlowSubmission(responseJson);
+	} catch (error) {
+		const validationMessage = error instanceof Error ? error.message : "The address details are invalid.";
+		console.warn("[WHATSAPP_FLOW_VALIDATION_ERROR]", {
+			error: validationMessage,
+			recipient: maskPhoneNumber(sender),
+		});
+		await upsertConversationState(
+			sender,
+			"DELIVERY_DETAILS",
+			env,
+			{ ...context, step: "FLOW_WAIT", delivery: {} },
+			messageId
+		);
+		await sendWhatsAppMessage(
+			sender,
+			`The address details could not be validated (${validationMessage}). Please submit the Delivery Address form again.`,
+			env
+		);
+		await sendDeliveryFlowPrompt(sender, context, env);
+		return true;
+	}
+
+	const customerId = Number(context.customer_id);
+	if (!Number.isSafeInteger(customerId) || customerId <= 0) {
+		throw new Error("Customer is missing from delivery Flow context");
+	}
+	const updateAddressId = Number(context.update_address_id);
+	const addressRecord = await saveDeliveryAddressForCustomer(
+		customerId,
+		address,
+		env,
+		Number.isSafeInteger(updateAddressId) && updateAddressId > 0
+			? updateAddressId
+			: undefined
+	);
+	const savedContext = {
+		...context,
+		step: "FLOW_SAVED",
+		address_id: addressRecord.id,
+		delivery: address,
+	};
+	await upsertConversationState(sender, "DELIVERY_DETAILS", env, savedContext, messageId);
+
+	if (context.source === "CHECKOUT_DELIVERY") {
+		await finishCheckoutWithDeliveryAddress(sender, messageId, addressRecord.id, env);
+		return true;
+	}
+
+	const orderId = Number(context.order_id);
+	if (!Number.isSafeInteger(orderId) || orderId <= 0) {
+		throw new Error("Order is missing from delivery Flow context");
+	}
+	const linked = await linkSavedDeliveryAddressToOrder(orderId, sender, addressRecord.id, env);
+	await upsertConversationState(sender, "MAIN_MENU", env, {}, messageId);
+	await sendWhatsAppMessage(
+		sender,
+		[
+			`✅ Delivery address confirmed for order #${orderId}.`,
+			"",
+			formatDeliveryAddress(linked.address),
 		].join("\n"),
 		env
 	);
 	return true;
 }
 
-const CUSTOMER_NOTIFICATION_STATUSES: Record<string, string> = {
-	PACKED: "📦 Order packed and awaiting shipment.",
-	SHIPPED: "🚚 Order shipped.",
-	OUT_FOR_DELIVERY: "🛵 Out for delivery.",
-	DELIVERED: "✅ Delivered successfully.",
+async function handleDeliveryConversation(
+	sender: string,
+	incomingText: string,
+	buttonId: string,
+	env: Env,
+	messageId = crypto.randomUUID()
+): Promise<boolean> {
+	const conversation = await getConversationState(sender, env);
+	if (!conversation || conversation.state !== "DELIVERY_DETAILS") {
+		return false;
+	}
+
+	const context = conversation.context ?? {};
+	const step = String(context.step ?? "") as DeliveryCollectionStep;
+	const answer = incomingText.trim();
+	if (step === "FLOW_WAIT" || step === "FLOW_SAVED") {
+		if (step === "FLOW_SAVED") {
+			await sendWhatsAppMessage(sender, "Your delivery address has been saved. Please wait while checkout continues.", env);
+			return true;
+		}
+		await sendWhatsAppMessage(
+			sender,
+			"Please complete the Delivery Address form to continue. No text address form is active.",
+			env
+		);
+		return true;
+	}
+	if (
+		step === "ADDRESS_FORM" ||
+		step === "ADDRESS_CONFIRM" ||
+		DELIVERY_STEP_ORDER.includes(step)
+	) {
+		await startDeliveryAddressFlow(sender, context, messageId, env);
+		return true;
+	}
+	if (step === "CHOICE") {
+		const choice = buttonId === "DELIVERY_DETAILS_YES" || /^(yes|y|yeah|yep)$/i.test(answer)
+			? "YES"
+			: buttonId === "DELIVERY_DETAILS_NO" || /^(no|n|nope)$/i.test(answer)
+				? "NO"
+				: null;
+		if (!choice) {
+			await sendWhatsAppMessage(sender, "Please choose Yes or No to continue.", env);
+			return true;
+		}
+		if (choice === "NO") {
+			return handleLegacyDeliveryConversation(sender, incomingText, buttonId, env);
+		}
+
+		const orderId = Number(context.order_id);
+		if (!Number.isSafeInteger(orderId) || orderId <= 0) {
+			throw new Error(`Invalid persisted delivery order for ${sender}`);
+		}
+		await setOrderDeliveryResponse(orderId, "YES", env);
+		await sendAddressOptionsForOrder(sender, orderId, env);
+		return true;
+	}
+
+	if (step === "ADDRESS_CHOICE") {
+		const useExisting = buttonId === "DELIVERY_USE_EXISTING" || /^(use existing|existing)$/i.test(answer);
+		const addNew = buttonId === "DELIVERY_ADD_NEW" || /^(add new|new address)$/i.test(answer);
+		if (!useExisting && !addNew) {
+			const addressId = Number(context.address_id);
+			const addresses = Number.isSafeInteger(addressId)
+				? await getCustomerDeliveryAddresses(Number(context.customer_id), env)
+				: [];
+			const address = addresses.find((item) => item.id === addressId);
+			if (address) {
+				await sendDeliveryAddressChoicePrompt(sender, address, env);
+			} else {
+				await startDeliveryAddressFlow(sender, context, buttonId || answer, env);
+			}
+			return true;
+		}
+
+		if (addNew) {
+			await startDeliveryAddressFlow(sender, context, answer || buttonId, env);
+			return true;
+		}
+
+		const addressId = Number(context.address_id);
+		if (!Number.isSafeInteger(addressId) || addressId <= 0) {
+			throw new Error("No saved delivery address is selected");
+		}
+		if (context.source === "CHECKOUT_DELIVERY") {
+			await finishCheckoutWithDeliveryAddress(sender, messageId, addressId, env);
+			return true;
+		}
+
+		const orderId = Number(context.order_id);
+		const linked = await linkSavedDeliveryAddressToOrder(orderId, sender, addressId, env);
+		await upsertConversationState(sender, "MAIN_MENU", env, {}, answer || buttonId);
+		await sendWhatsAppMessage(
+			sender,
+			`✅ Saved delivery address linked to order #${orderId}.\nRecipient: ${linked.address.recipient_name}`,
+			env
+		);
+		return true;
+	}
+
+	throw new Error(`Unsupported persisted delivery conversation step: ${step}`);
+}
+
+const CUSTOMER_NOTIFICATION_STATUSES: Record<string, {
+	messageType: string;
+	currentStatus: string;
+	message: (orderId: number) => string;
+}> = {
+	pending: {
+		messageType: "ORDER_PLACED",
+		currentStatus: "Order placed",
+		message: (orderId) => `Your order #${orderId} has been placed successfully.`,
+	},
+	paid: {
+		messageType: "ORDER_PLACED",
+		currentStatus: "Order placed",
+		message: (orderId) => `Your order #${orderId} has been placed successfully.`,
+	},
+	PACKED: {
+		messageType: "PROCESSING",
+		currentStatus: "Processing",
+		message: (orderId) => `Your order #${orderId} is now being processed.`,
+	},
+	SHIPPED: {
+		messageType: "SHIPPED",
+		currentStatus: "Shipped",
+		message: (orderId) => `Your order #${orderId} has been shipped.`,
+	},
+	OUT_FOR_DELIVERY: {
+		messageType: "OUT_FOR_DELIVERY",
+		currentStatus: "Out for delivery",
+		message: (orderId) => `Your order #${orderId} is out for delivery.`,
+	},
+	DELIVERED: {
+		messageType: "DELIVERED",
+		currentStatus: "Delivered",
+		message: (orderId) => `Your order #${orderId} has been delivered.`,
+	},
+	fulfilled: {
+		messageType: "DELIVERED",
+		currentStatus: "Delivered",
+		message: (orderId) => `Your order #${orderId} has been delivered.`,
+	},
+	cancelled: {
+		messageType: "CANCELLED",
+		currentStatus: "Cancelled",
+		message: (orderId) => `Your order #${orderId} has been cancelled.`,
+	},
 };
 
 async function sendOrderStatusNotification(
-	orderId: number,
-	status: OrderStatus,
+	order: Pick<Order, "id" | "status" | "customer_id" | "customer_phone">,
+	previousStatus: string,
 	env: Env
 ): Promise<void> {
-	console.log("[ORDER STATUS NOTIFICATION] Started", { orderId, status });
+	const orderId = order.id;
+	const status = order.status as OrderStatus;
 	const message = CUSTOMER_NOTIFICATION_STATUSES[status];
-	if (!message) {
-		console.log("[ORDER STATUS NOTIFICATION] No notification configured", { orderId, status });
-		return;
-	}
-
 	const client = getAdminClient(env);
-	const { data: event, error: eventLookupError } = await client
-		.from("notification_events")
-		.select("id, customer_phone, payload")
-		.eq("order_id", orderId)
-		.eq("related_status", status)
-		.eq("status", "queued")
-		.order("created_at", { ascending: false })
-		.limit(1)
-		.maybeSingle();
-	console.log("[ORDER STATUS NOTIFICATION] Event lookup result", {
-		orderId,
-		status,
-		eventId: event?.id ?? null,
-		hasEvent: Boolean(event),
-		error: eventLookupError?.message ?? null,
-	});
-
-	if (eventLookupError) {
-		console.error("Notification event lookup failed:", eventLookupError);
+	if (!message) {
+		console.log("[NOTIFICATION]", {
+			orderId,
+			status,
+			messageType: null,
+			messageSent: false,
+			reason: "No customer message is configured for this status",
+		});
+		try {
+			const { data: event } = await client
+				.from("notification_events")
+				.select("id")
+				.eq("order_id", orderId)
+				.eq("related_status", status)
+				.eq("status", "queued")
+				.order("created_at", { ascending: false })
+				.limit(1)
+				.maybeSingle();
+			if (event) {
+				const { error } = await client
+					.from("notification_events")
+					.update({
+						status: "skipped",
+						reason: "No customer message is configured for this status",
+					})
+					.eq("id", event.id)
+					.eq("status", "queued");
+				if (error) {
+					console.error("[NOTIFICATION_ERROR]", {
+						orderId,
+						stage: "mark_skipped",
+						error: error.message,
+					});
+				}
+			}
+		} catch (error) {
+			console.error("[NOTIFICATION_ERROR]", {
+				orderId,
+				stage: "mark_skipped",
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 		return;
 	}
 
-	if (!event) {
-		console.error("Queued notification event not found:", { orderId, status });
+	let event: { id: number; payload: Record<string, unknown> | null } | null = null;
+	let customer: { name: string | null; whatsapp_number: string } | null = null;
+
+	try {
+		const customerQuery = client
+			.from("customers")
+			.select("name, whatsapp_number");
+		let customerResult;
+		if (order.customer_id != null) {
+			customerResult = await customerQuery
+				.eq("id", order.customer_id)
+				.maybeSingle();
+			if (!customerResult.data && order.customer_phone) {
+				customerResult = await client
+					.from("customers")
+					.select("name, whatsapp_number")
+					.eq("whatsapp_number", order.customer_phone)
+					.maybeSingle();
+			}
+		} else if (order.customer_phone) {
+			customerResult = await customerQuery
+				.eq("whatsapp_number", order.customer_phone)
+				.maybeSingle();
+		}
+
+		if (customerResult?.error) {
+			console.error("[NOTIFICATION_ERROR]", {
+				orderId,
+				stage: "customer_lookup",
+				error: customerResult.error.message,
+			});
+		} else {
+			customer = customerResult?.data ?? null;
+		}
+	} catch (error) {
+		console.error("[NOTIFICATION_ERROR]", {
+			orderId,
+			stage: "customer_lookup",
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+
+	const recipientPhone = order.customer_phone || customer?.whatsapp_number || "";
+	if (!recipientPhone) {
+		console.error("[NOTIFICATION_ERROR]", {
+			orderId,
+			messageType: message.messageType,
+			error: "Customer phone number is missing for this order",
+		});
 		return;
 	}
 
+	try {
+		const { data: eventRecord, error: eventLookupError } = await client
+			.from("notification_events")
+			.select("id, payload")
+			.eq("order_id", orderId)
+			.eq("related_status", status)
+			.eq("status", "queued")
+			.order("created_at", { ascending: false })
+			.limit(1)
+			.maybeSingle();
+		if (eventLookupError) {
+			console.error("[NOTIFICATION_ERROR]", {
+				orderId,
+				stage: "event_lookup",
+				error: eventLookupError.message,
+			});
+		} else {
+			event = eventRecord;
+		}
+	} catch (error) {
+		console.error("[NOTIFICATION_ERROR]", {
+			orderId,
+			stage: "event_lookup",
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+
+	const customerName = customer?.name?.trim() || "there";
+	const customerMessage = [
+		`Hi ${customerName}, ${message.message(orderId)}`,
+		`Current status: ${message.currentStatus}.`,
+	].join("\n");
 	const payload = {
-		...((event.payload as Record<string, unknown> | null) ?? {}),
-		message,
+		...((event?.payload as Record<string, unknown> | null) ?? {}),
+		customer_name: customerName,
+		order_id: orderId,
+		previous_status: previousStatus,
+		new_status: status,
+		message_type: message.messageType,
+		message: customerMessage,
 	};
 
 	try {
-		console.log("[ORDER STATUS NOTIFICATION] Sending WhatsApp message", {
+		console.log("[NOTIFICATION]", {
 			orderId,
-			status,
-			customerPhone: event.customer_phone,
+			phoneNumber: maskPhoneNumber(recipientPhone),
+			messageType: message.messageType,
+			messageSent: false,
+			stage: "sending",
 		});
-		await sendWhatsAppMessage(
-			String(event.customer_phone),
-			[`Order #${orderId}`, message].join("\n"),
+		const sendResult = await sendWhatsAppMessage(
+			recipientPhone,
+			customerMessage,
 			env
 		);
-		console.log("[ORDER STATUS NOTIFICATION] Meta response received", {
+		console.log("[NOTIFICATION]", {
 			orderId,
-			status,
-			result: "success",
+			phoneNumber: maskPhoneNumber(recipientPhone),
+			messageType: message.messageType,
+			messageSent: true,
 		});
 
-		const { error: sentUpdateError } = await client
-			.from("notification_events")
-			.update({
-				status: "sent",
-				payload,
-				sent_at: new Date().toISOString(),
-				updated_at: new Date().toISOString(),
-			})
-			.eq("id", event.id)
-			.eq("status", "queued");
-		console.log("[ORDER STATUS NOTIFICATION] Sent-state update result", {
-			orderId,
-			status,
-			eventId: event.id,
-			success: !sentUpdateError,
-			error: sentUpdateError?.message ?? null,
-		});
-
-		if (sentUpdateError) {
-			console.error("Notification event sent-state update failed:", sentUpdateError);
+		if (event) {
+			try {
+				const { error: sentUpdateError } = await client
+					.from("notification_events")
+					.update({
+						status: "sent",
+						payload: {
+							...payload,
+							meta_message_id: sendResult.metaMessageId,
+							delivery_status: "sent",
+						},
+						sent_at: new Date().toISOString(),
+						updated_at: new Date().toISOString(),
+					})
+					.eq("id", event.id)
+					.eq("status", "queued");
+				if (sentUpdateError) throw new Error(sentUpdateError.message);
+			} catch (error) {
+				console.error("[NOTIFICATION_ERROR]", {
+					orderId,
+					messageType: message.messageType,
+					stage: "mark_sent",
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 		}
 	} catch (error) {
-		console.error("Order status WhatsApp notification failed:", error);
-		const { error: failedUpdateError } = await client
-			.from("notification_events")
-			.update({
-				status: "failed",
-				payload,
-				reason: error instanceof Error ? error.message : "WhatsApp delivery failed",
-				updated_at: new Date().toISOString(),
-			})
-			.eq("id", event.id)
-			.eq("status", "queued");
-		console.log("[ORDER STATUS NOTIFICATION] Failed-state update result", {
+		const errorDetails = error instanceof Error ? error.message : String(error);
+		console.error("[NOTIFICATION_ERROR]", {
 			orderId,
-			status,
-			eventId: event.id,
-			success: !failedUpdateError,
-			error: failedUpdateError?.message ?? null,
+			phoneNumber: maskPhoneNumber(order.customer_phone || ""),
+			messageType: message.messageType,
+			error: errorDetails,
 		});
 
-		if (failedUpdateError) {
-			console.error("Notification event failed-state update failed:", failedUpdateError);
+		if (event) {
+			try {
+				const { error: failedUpdateError } = await client
+					.from("notification_events")
+					.update({
+						status: "failed",
+						reason: errorDetails,
+						updated_at: new Date().toISOString(),
+					})
+					.eq("id", event.id)
+					.eq("status", "queued");
+				if (failedUpdateError) throw new Error(failedUpdateError.message);
+			} catch (updateError) {
+				console.error("[NOTIFICATION_ERROR]", {
+					orderId,
+					messageType: message.messageType,
+					stage: "mark_failed",
+					error: updateError instanceof Error ? updateError.message : String(updateError),
+				});
+			}
 		}
 	}
 }
@@ -3935,15 +4652,22 @@ if (
 			}
 
 			try {
-				const orders: Order[] = [];
+				type CustomerSummary = { name: string | null; whatsapp_number: string };
+				type OrderWithCustomer = Order & {
+					customer?: CustomerSummary | null;
+					order_items?: Array<{ product_name: string; quantity: number }>;
+					status_history?: Array<Record<string, unknown>>;
+				};
+				const orders: OrderWithCustomer[] = [];
 				const pageSize = 1000;
+				const client = getAdminClient(env);
 				let from = 0;
-				let page: Order[];
+				let page: OrderWithCustomer[];
 
 				do {
-					const { data, error } = await getAdminClient(env)
+					const { data, error } = await client
 						.from("orders")
-						.select("*")
+						.select("*, customer:customers(name, whatsapp_number), order_items(product_name, quantity)")
 						.order("created_at", { ascending: false })
 						.range(from, from + pageSize - 1);
 
@@ -3951,15 +4675,70 @@ if (
 						throw new Error(error.message);
 					}
 
-					page = (data ?? []) as Order[];
+					page = (data ?? []) as OrderWithCustomer[];
 					orders.push(...page);
 					from += pageSize;
 				} while (page.length === pageSize);
 
+				const statusHistoryByOrder = new Map<number, Array<Record<string, unknown>>>();
+				if (orders.length > 0) {
+					const { data: statusHistory, error: historyError } = await client
+						.from("order_status_history")
+						.select("*")
+						.in("order_id", orders.map((order) => order.id))
+						.order("created_at", { ascending: true });
+					if (historyError) throw new Error(historyError.message);
+					for (const entry of (statusHistory ?? []) as Array<Record<string, unknown>>) {
+						const orderId = Number(entry.order_id);
+						statusHistoryByOrder.set(orderId, [
+							...(statusHistoryByOrder.get(orderId) ?? []),
+							entry,
+						]);
+					}
+				}
+
+				const fallbackPhones = [...new Set(
+					orders
+						.filter((order) => !order.customer?.name && order.customer_phone)
+						.map((order) => order.customer_phone)
+				)];
+				const customersByPhone = new Map<string, CustomerSummary>();
+				if (fallbackPhones.length > 0) {
+					const { data: fallbackCustomers, error: fallbackError } = await client
+						.from("customers")
+						.select("name, whatsapp_number")
+						.in("whatsapp_number", fallbackPhones);
+					if (fallbackError) {
+						throw new Error(fallbackError.message);
+					}
+					for (const customer of (fallbackCustomers ?? []) as CustomerSummary[]) {
+						customersByPhone.set(customer.whatsapp_number, customer);
+					}
+				}
+				const customersEnriched = orders.map(({ customer, order_items, ...order }) => {
+					const items = order_items ?? [];
+					return {
+						...order,
+						customer_name:
+							customer?.name ||
+							customersByPhone.get(order.customer_phone)?.name ||
+							null,
+						product_name:
+							items.map((item) => item.product_name).filter(Boolean).join(", ") ||
+							(order as Order & { product_name?: string }).product_name ||
+							null,
+						quantity:
+							items.length > 0
+								? items.reduce((total, item) => total + Number(item.quantity || 0), 0)
+								: (order as Order & { quantity?: number }).quantity ?? 1,
+						status_history: statusHistoryByOrder.get(Number(order.id)) ?? [],
+					};
+				});
+
 				return Response.json({
 					success: true,
-					count: orders.length,
-					orders,
+					count: customersEnriched.length,
+					orders: customersEnriched,
 				});
 			} catch (error) {
 				console.error("Admin order list failed:", error);
@@ -3970,6 +4749,131 @@ if (
 			}
 		}
 		
+if (
+  request.method === "POST" &&
+  url.pathname === "/api/admin/customers"
+) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json(
+      { error: "Admin API is not configured" },
+      { status: 503 }
+    );
+  }
+
+  if (!isAdminRequest(request, env)) {
+    return Response.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
+  }
+
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return Response.json({ error: "Request body must be an object" }, { status: 400 });
+  }
+
+  const input = body as Record<string, unknown>;
+  const name = typeof input.customer_name === "string" ? input.customer_name.trim() : "";
+  const rawPhone = typeof input.whatsapp_number === "string" ? input.whatsapp_number.trim() : "";
+  const email = typeof input.email === "string" ? input.email.trim() : "";
+  const phoneDigits = rawPhone.replace(/\D/g, "");
+  const whatsappNumber =
+    phoneDigits.length === 10
+      ? `91${phoneDigits}`
+      : phoneDigits.startsWith("0") && phoneDigits.length === 11
+        ? `91${phoneDigits.slice(1)}`
+        : phoneDigits;
+
+  if (!name) {
+    return Response.json({ error: "Customer name is required" }, { status: 400 });
+  }
+
+  if (name.length > 200) {
+    return Response.json({ error: "Customer name must be 200 characters or fewer" }, { status: 400 });
+  }
+
+  if (phoneDigits.length < 10 || phoneDigits.length > 15) {
+    return Response.json({ error: "A valid phone number is required" }, { status: 400 });
+  }
+
+  if (input.email !== undefined && input.email !== null && typeof input.email !== "string") {
+    return Response.json({ error: "Email address must be text" }, { status: 400 });
+  }
+
+  if (email && (
+    email.length > 320 ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  )) {
+    return Response.json({ error: "A valid email address is required" }, { status: 400 });
+  }
+
+  try {
+    const supabase = getAdminClient(env);
+    const pageSize = 1000;
+    let from = 0;
+    let phonePage: Array<{ whatsapp_number: string }>;
+    do {
+      const { data, error } = await supabase
+        .from("customers")
+        .select("whatsapp_number")
+        .range(from, from + pageSize - 1);
+      if (error) throw new Error(error.message);
+      phonePage = (data ?? []) as Array<{ whatsapp_number: string }>;
+      const duplicate = phonePage.some((customer) => {
+        const existingDigits = String(customer.whatsapp_number ?? "").replace(/\D/g, "");
+        const existingCanonical =
+          existingDigits.length === 10
+            ? `91${existingDigits}`
+            : existingDigits.startsWith("0") && existingDigits.length === 11
+              ? `91${existingDigits.slice(1)}`
+              : existingDigits;
+        return existingCanonical === whatsappNumber;
+      });
+      if (duplicate) {
+        return Response.json(
+          { error: "A customer with this phone number already exists" },
+          { status: 409 }
+        );
+      }
+      from += pageSize;
+    } while (phonePage.length === pageSize);
+
+    const { data: customer, error } = await supabase
+      .from("customers")
+      .insert({
+        name,
+        whatsapp_number: whatsappNumber,
+        email: email || null,
+      })
+      .select("*")
+      .single();
+
+    if (error) {
+      if (error.code === "23505") {
+        return Response.json(
+          { error: "A customer with this phone number already exists" },
+          { status: 409 }
+        );
+      }
+      throw new Error(error.message);
+    }
+
+    return Response.json({ success: true, customer }, { status: 201 });
+  } catch (error) {
+    console.error("Admin customer creation failed:", error);
+    return Response.json(
+      { success: false, error: "Could not create customer" },
+      { status: 500 }
+    );
+  }
+}
+
 if (
   request.method === "GET" &&
   url.pathname === "/api/admin/customers"
@@ -3998,12 +4902,20 @@ if (
 	
 const { data: orders, error: ordersError } = await getAdminClient(env)
   .from("orders")
-  .select("id, customer_id, created_at");
+  .select("id, customer_id, customer_phone, created_at");
 
 if (ordersError) throw new Error(ordersError.message);
+const canonicalPhone = (value: string | null | undefined) => {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  if (digits.length === 10) return `91${digits}`;
+  if (digits.startsWith("0") && digits.length === 11) return `91${digits.slice(1)}`;
+  return digits;
+};
 const customersWithOrderStats = (data ?? []).map((customer) => {
   const customerOrders = (orders ?? []).filter(
-    (order) => String(order.customer_id) === String(customer.id)
+(order) =>
+  String(order.customer_id) === String(customer.id) ||
+  canonicalPhone(order.customer_phone) === canonicalPhone(customer.whatsapp_number)
   );
 
   const latestOrder = customerOrders.reduce<
@@ -4047,6 +4959,159 @@ const customersWithOrderStats = (data ?? []).map((customer) => {
 |--------------------------------------------------------------------------
 */
 
+
+const customerHistoryMatch = url.pathname.match(
+  /^\/api\/admin\/customers\/(\d+)\/history$/
+);
+
+if (request.method === "GET" && customerHistoryMatch) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json({ error: "Admin API is not configured" }, { status: 503 });
+  }
+  if (!isAdminRequest(request, env)) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const customerId = Number(customerHistoryMatch[1]);
+  if (!Number.isSafeInteger(customerId) || customerId <= 0) {
+    return Response.json({ error: "Invalid customer ID" }, { status: 400 });
+  }
+
+  try {
+    const supabase = getAdminClient(env);
+    const { data: customer, error: customerError } = await supabase
+      .from("customers")
+      .select("id, whatsapp_number")
+      .eq("id", customerId)
+      .maybeSingle();
+    if (customerError) throw new Error(customerError.message);
+    if (!customer) {
+      return Response.json({ error: "Customer not found" }, { status: 404 });
+    }
+
+    const [
+      ordersResult,
+      phoneOrdersResult,
+      ticketsResult,
+      sessionsResult,
+      notificationsResult,
+      stateResult,
+      contextResult,
+    ] = await Promise.all([
+      supabase.from("orders").select("*").eq("customer_id", customerId)
+        .order("created_at", { ascending: false }),
+      supabase.from("orders").select("*").eq("customer_phone", customer.whatsapp_number)
+        .order("created_at", { ascending: false }),
+      supabase.from("support_tickets").select("*").eq("customer_id", customerId)
+        .order("created_at", { ascending: false }),
+      supabase.from("support_sessions").select("*").eq("customer_id", customerId)
+        .order("created_at", { ascending: false }),
+      supabase.from("notification_events").select("*")
+        .eq("customer_phone", customer.whatsapp_number)
+        .order("created_at", { ascending: false }),
+      supabase.from("conversation_state").select("*")
+        .eq("whatsapp_number", customer.whatsapp_number).maybeSingle(),
+      supabase.from("conversation_context").select("*")
+        .eq("phone_number", customer.whatsapp_number).maybeSingle(),
+    ]);
+
+    const queryErrors = [
+      ordersResult.error,
+      phoneOrdersResult.error,
+      ticketsResult.error,
+      sessionsResult.error,
+      notificationsResult.error,
+      stateResult.error,
+      contextResult.error,
+    ].filter(Boolean);
+    if (queryErrors.length) {
+      throw new Error(queryErrors.map((error) => error?.message).join("; "));
+    }
+
+    const ordersById = new Map<number, Record<string, unknown>>();
+    for (const order of [...(ordersResult.data ?? []), ...(phoneOrdersResult.data ?? [])]) {
+      ordersById.set(Number(order.id), order as Record<string, unknown>);
+    }
+    const orders = [...ordersById.values()];
+    const orderIds = orders.map((order) => order.id);
+    const ticketIds = (ticketsResult.data ?? []).map((ticket) => ticket.id);
+    const [itemsResult, statusHistoryResult, deliveryResult, messagesResult, supportMessagesResult] =
+      await Promise.all([
+        orderIds.length
+          ? supabase.from("order_items").select("*").in("order_id", orderIds)
+          : Promise.resolve({ data: [], error: null }),
+        orderIds.length
+          ? supabase.from("order_status_history").select("*").in("order_id", orderIds)
+            .order("created_at", { ascending: false })
+          : Promise.resolve({ data: [], error: null }),
+        orderIds.length
+          ? supabase.from("order_delivery_details")
+            .select("*, delivery_address:delivery_addresses(*)")
+            .in("order_id", orderIds)
+          : Promise.resolve({ data: [], error: null }),
+        ticketIds.length
+          ? supabase.from("ticket_messages").select("*").in("ticket_id", ticketIds)
+            .order("created_at", { ascending: false })
+          : Promise.resolve({ data: [], error: null }),
+        ticketIds.length
+          ? supabase.from("support_messages").select("*").in("ticket_id", ticketIds)
+            .order("created_at", { ascending: false })
+          : Promise.resolve({ data: [], error: null }),
+      ]);
+
+    const secondaryErrors = [
+      itemsResult.error,
+      statusHistoryResult.error,
+      deliveryResult.error,
+      messagesResult.error,
+      supportMessagesResult.error,
+    ].filter(Boolean);
+    if (secondaryErrors.length) {
+      throw new Error(secondaryErrors.map((error) => error?.message).join("; "));
+    }
+
+    const itemsByOrder = new Map<number, Array<Record<string, unknown>>>();
+    for (const item of (itemsResult.data ?? []) as Array<Record<string, unknown>>) {
+      const orderId = Number(item.order_id);
+      itemsByOrder.set(orderId, [...(itemsByOrder.get(orderId) ?? []), item]);
+    }
+    const orderHistoryByOrder = new Map<number, Array<Record<string, unknown>>>();
+    for (const entry of (statusHistoryResult.data ?? []) as Array<Record<string, unknown>>) {
+      const orderId = Number(entry.order_id);
+      orderHistoryByOrder.set(orderId, [...(orderHistoryByOrder.get(orderId) ?? []), entry]);
+    }
+    const deliveryByOrder = new Map<number, Record<string, unknown>>();
+    for (const delivery of (deliveryResult.data ?? []) as Array<Record<string, unknown>>) {
+      deliveryByOrder.set(Number(delivery.order_id), delivery);
+    }
+    const ordersWithHistory = orders.map((order) => ({
+      ...order,
+      order_items: itemsByOrder.get(Number(order.id)) ?? [],
+      status_history: orderHistoryByOrder.get(Number(order.id)) ?? [],
+      delivery: deliveryByOrder.get(Number(order.id)) ?? null,
+    }));
+
+    return Response.json({
+      success: true,
+      history: {
+        orders: ordersWithHistory,
+        support_tickets: ticketsResult.data ?? [],
+        support_sessions: sessionsResult.data ?? [],
+        ticket_messages: messagesResult.data ?? [],
+        support_messages: supportMessagesResult.data ?? [],
+        notification_events: notificationsResult.data ?? [],
+        conversation_state: stateResult.data ?? null,
+        conversation_context: contextResult.data ?? null,
+      },
+    });
+  } catch (error) {
+    console.error("Admin customer history failed:", error);
+    return Response.json(
+      { success: false, error: "Could not load customer history" },
+      { status: 500 }
+    );
+  }
+}
 
 const customerDetailsMatch = url.pathname.match(
   /^\/api\/admin\/customers\/([^/]+)$/
@@ -4499,6 +5564,165 @@ if (
 |--------------------------------------------------------------------------
 */
 
+const manualCustomerOrderMatch = url.pathname.match(
+  /^\/api\/admin\/customers\/(\d+)\/orders$/
+);
+
+if (request.method === "POST" && manualCustomerOrderMatch) {
+  if (!env.ADMIN_API_TOKEN) {
+    return Response.json({ error: "Admin API is not configured" }, { status: 503 });
+  }
+  if (!isAdminRequest(request, env)) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const customerId = Number(manualCustomerOrderMatch[1]);
+  if (!Number.isSafeInteger(customerId) || customerId <= 0) {
+    return Response.json({ error: "Invalid customer ID" }, { status: 400 });
+  }
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ error: "Request body must be valid JSON" }, { status: 400 });
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return Response.json({ error: "Request body must be an object" }, { status: 400 });
+  }
+
+  const input = body as Record<string, unknown>;
+  const productId = Number(input.product_id);
+  const quantity = Number(input.quantity);
+  const unitPrice = Number(input.unit_price);
+  const notes = typeof input.notes === "string" ? input.notes.trim() : "";
+  const initialStatus = typeof input.initial_status === "string"
+    ? input.initial_status
+    : "pending";
+  const deliveryAddress = input.delivery_address;
+  const validStatuses = [
+    "pending", "payment_pending", "paid", "failed", "cancelled",
+    "fulfilled", "PACKED", "SHIPPED", "OUT_FOR_DELIVERY", "DELIVERED",
+  ];
+
+  if (!Number.isSafeInteger(productId) || productId <= 0) {
+    return Response.json({ error: "A valid product is required" }, { status: 400 });
+  }
+  if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+    return Response.json({ error: "Quantity must be a positive whole number" }, { status: 400 });
+  }
+  if (
+    input.unit_price === undefined ||
+    input.unit_price === null ||
+    input.unit_price === "" ||
+    !Number.isFinite(unitPrice) ||
+    unitPrice < 0 ||
+    unitPrice > 999999999
+  ) {
+    return Response.json({ error: "Price must be a valid non-negative amount" }, { status: 400 });
+  }
+  if (notes.length > 2000) {
+    return Response.json({ error: "Notes must be 2000 characters or fewer" }, { status: 400 });
+  }
+  if (!validStatuses.includes(initialStatus)) {
+    return Response.json({ error: "Unsupported initial order status" }, { status: 400 });
+  }
+  if (!deliveryAddress || typeof deliveryAddress !== "object" || Array.isArray(deliveryAddress)) {
+    return Response.json({ error: "Delivery address is required" }, { status: 400 });
+  }
+
+  const address = deliveryAddress as Record<string, unknown>;
+  const requiredAddressFields = ["address_line_1", "city", "state", "pincode"];
+  if (requiredAddressFields.some(
+    (field) => typeof address[field] !== "string" || !address[field].trim()
+  ) || typeof address.pincode !== "string" || !/^\d{6}$/.test(address.pincode.trim())) {
+    return Response.json(
+      { error: "Address, city, state, and a valid six-digit pincode are required" },
+      { status: 400 }
+    );
+  }
+  const optionalAddressFields = [
+    "recipient_name", "recipient_phone", "email",
+    "address_line_2", "landmark",
+  ];
+  if (optionalAddressFields.some(
+    (field) => address[field] !== undefined && typeof address[field] !== "string"
+  )) {
+    return Response.json({ error: "Delivery address fields must be text" }, { status: 400 });
+  }
+
+  try {
+    const { data, error } = await getAdminClient(env).rpc("create_admin_order", {
+      p_customer_id: customerId,
+      p_product_id: productId,
+      p_quantity: quantity,
+      p_unit_price: unitPrice,
+      p_notes: notes || null,
+      p_delivery_address: address,
+      p_initial_status: initialStatus,
+    });
+
+    if (error) {
+      if (error.code === "P0002") {
+        return Response.json(
+          { error: error.message.includes("Customer") ? "Customer not found" : "Active product not found" },
+          { status: 404 }
+        );
+      }
+      if (error.code === "22023") {
+        return Response.json({ error: error.message }, { status: 400 });
+      }
+      if (error.code === "PGRST202") {
+        console.error("[ADMIN_ORDER_CREATE] Database function unavailable", {
+          code: error.code,
+        });
+        return Response.json(
+          {
+            success: false,
+            error:
+              "Order creation is unavailable because create_admin_order() is missing from this Supabase project's API schema. Apply supabase/migrations/016_admin_crm_orders.sql to the project configured by SUPABASE_URL, then retry.",
+          },
+          { status: 503 }
+        );
+      }
+      if (error.code === "23502" && error.message.includes("profile_name")) {
+        console.error("[ADMIN_ORDER_CREATE] Delivery-address schema mismatch", {
+          code: error.code,
+          column: "profile_name",
+        });
+        return Response.json(
+          {
+            success: false,
+            error:
+              "The manual-order database function is outdated for this project's delivery-address schema. Apply supabase/migrations/017_fix_manual_order_delivery_address.sql, then retry.",
+          },
+          { status: 503 }
+        );
+      }
+      throw new Error(error.message);
+    }
+
+    const result = data as {
+      order?: Record<string, unknown>;
+      item?: Record<string, unknown>;
+      delivery_address?: Record<string, unknown>;
+    } | null;
+    if (!result?.order) {
+      throw new Error("Order creation returned no order");
+    }
+    return Response.json(
+      { success: true, ...result },
+      { status: 201 }
+    );
+  } catch (error) {
+    console.error("Admin manual order creation failed:", error);
+    return Response.json(
+      { success: false, error: "Could not create order" },
+      { status: 500 }
+    );
+  }
+}
+
 const customerOrdersMatch = url.pathname.match(
   /^\/api\/admin\/customers\/([^/]+)\/orders$/
 );
@@ -4577,7 +5801,7 @@ if (request.method === "GET" && customerOrdersMatch) {
 			}
 
 			try {
-				await getOrderStatus(orderId, env);
+				const previousStatus = await getOrderStatus(orderId, env);
 				const order = await updateOrderStatus(
 					orderId,
 					body.status as OrderStatus,
@@ -4588,7 +5812,14 @@ if (request.method === "GET" && customerOrdersMatch) {
 						reason: body.reason ?? null,
 					}
 				);
-				await sendOrderStatusNotification(orderId, order.status as OrderStatus, env);
+				console.log("[STATUS_UPDATE]", {
+					orderId,
+					oldStatus: previousStatus,
+					newStatus: order.status,
+				});
+				if (previousStatus !== order.status) {
+					await sendOrderStatusNotification(order, previousStatus, env);
+				}
 				const timeline = await getOrderTimeline(orderId, env);
 				const { data: notificationEvent, error: notificationLookupError } = await getAdminClient(env)
 					.from("notification_events")
@@ -4599,13 +5830,17 @@ if (request.method === "GET" && customerOrdersMatch) {
 					.maybeSingle();
 
 				if (notificationLookupError) {
-					throw new Error(`Notification event lookup failed: ${notificationLookupError.message}`);
+					console.error("[NOTIFICATION_ERROR]", {
+						orderId,
+						stage: "response_event_lookup",
+						error: notificationLookupError.message,
+					});
 				}
 
 				return Response.json({
 					order,
 					timeline,
-					notification_event: notificationEvent,
+					notification_event: notificationLookupError ? null : notificationEvent,
 				});
 			} catch (error) {
 				console.error("Admin order status update failed:", error);
@@ -5588,7 +6823,7 @@ if (request.method === "PATCH" && addressDefaultMatch) {
 								}
 							}
 							const step = delivery.customer_response === "YES"
-								? "RECIPIENT_NAME"
+								? "ADDRESS_FORM"
 								: "CHOICE";
 							await upsertConversationState(
 								result.customerPhone,
@@ -5605,7 +6840,7 @@ if (request.method === "PATCH" && addressDefaultMatch) {
 									env
 								);
 							} else {
-								await sendDeliveryStepPrompt(result.customerPhone, "RECIPIENT_NAME", env);
+								await sendAddressOptionsForOrder(result.customerPhone, result.orderId, env);
 							}
 						} else if (context.step === "CHOICE") {
 							await sendDeliveryChoicePrompt(
@@ -5641,8 +6876,10 @@ if (request.method === "PATCH" && addressDefaultMatch) {
 			console.log("[WEBHOOK POST] Handler entered");
 
 			let body: any;
+			let rawBody: string;
 			try {
-				body = await request.json();
+				rawBody = await request.text();
+				body = JSON.parse(rawBody);
 			} catch (error) {
 				console.error("[WEBHOOK POST] JSON parse failed:", error);
 				console.log("[RETURN] POST /webhook 400");
@@ -5652,14 +6889,30 @@ if (request.method === "PATCH" && addressDefaultMatch) {
 				);
 			}
 
-			console.log(
-				"Incoming WhatsApp Event:",
-				JSON.stringify(
-					body,
-					null,
-					2
-				)
-			);
+			const hasDeliveryStatuses = (body.entry ?? [])
+				.some((entry: any) => (entry.changes ?? [])
+					.some((change: any) => (change.value?.statuses ?? []).length > 0));
+			if (hasDeliveryStatuses) {
+				if (!env.WHATSAPP_APP_SECRET) {
+					console.error("[WHATSAPP_DELIVERY_STATUS_ERROR]", {
+						error: "WHATSAPP_APP_SECRET is not configured; refusing unverified status callback",
+					});
+					return new Response("Webhook verification is not configured", { status: 503 });
+				}
+				const signature = request.headers.get("X-Hub-Signature-256") ?? "";
+				const signatureValid = await verifyWhatsAppWebhookSignature(
+					rawBody,
+					signature,
+					env.WHATSAPP_APP_SECRET
+				);
+				if (!signatureValid) {
+					console.error("[WHATSAPP_DELIVERY_STATUS_ERROR]", {
+						error: "Invalid X-Hub-Signature-256",
+					});
+					return new Response("Invalid webhook signature", { status: 401 });
+				}
+				await recordWhatsAppDeliveryStatuses(body, env);
+			}
 
 			const message =
 				body.entry?.[0]
@@ -5701,12 +6954,17 @@ if (request.method === "PATCH" && addressDefaultMatch) {
 				message.interactive
 					?.list_reply
 					?.id ?? "";
+			const flowResponseJson =
+				message.interactive
+					?.nfm_reply
+					?.response_json;
 
 			console.log(
 				"Parsed WhatsApp input:",
 				{
-					sender,
-					incomingText,
+					sender: maskPhoneNumber(sender),
+					hasText: Boolean(incomingTextRaw),
+					textLength: incomingTextRaw.length,
 					buttonId,
 					listRowId,
 				}
@@ -5715,7 +6973,13 @@ if (request.method === "PATCH" && addressDefaultMatch) {
 			ctx.waitUntil(
 				(async () => {
 					try {
-						if (await handleDeliveryConversation(sender, incomingTextRaw, buttonId, env)) {
+						if (typeof flowResponseJson === "string" &&
+							await handleDeliveryFlowSubmission(sender, flowResponseJson, env, messageId)) {
+							console.log("[WEBHOOK BRANCH RETURN] WhatsApp delivery address Flow");
+							return;
+						}
+
+						if (await handleDeliveryConversation(sender, incomingTextRaw, buttonId, env, messageId)) {
 							console.log("[WEBHOOK BRANCH RETURN] Delivery details conversation");
 							return;
 						}
@@ -6010,34 +7274,13 @@ if (request.method === "PATCH" && addressDefaultMatch) {
 							"CHECKOUT_CART"
 						) {
 							console.log("[WEBHOOK BRANCH] Checkout cart");
-							await upsertConversationState(
-								sender,
-								"CHECKOUT",
-								env,
-								{ cart_checkout: true },
-								messageId
-							);
 							try {
-								const { order } = await createOrderFromCart(sender, env, messageId);
-								const paymentLink = await createCommercePaymentLink(order, env);
-								await updateOrderPaymentLink(order.id, paymentLink.id, paymentLink.short_url, env);
-								await sendWhatsAppMessage(
-									sender,
-									[
-										"🧾 Order created",
-										"",
-										`Order: #${order.id}`,
-										"",
-										"Complete your payment:",
-										paymentLink.short_url,
-									].join("\n"),
-									env
-								);
+								await startCheckoutAddressCollection(sender, messageId, env);
 							} catch (error) {
 								console.error("Commerce checkout failed:", error);
 								await sendWhatsAppMessage(
 									sender,
-									"Checkout failed. Please review your cart and try again.",
+									"Checkout could not start. Please review your cart and try again.",
 									env
 								);
 							}
@@ -6516,12 +7759,23 @@ await sendWhatsAppMessage(
     );
 }
 
+let whatsappConfigDiagnosticsLogged = false;
+
 export default {
   async fetch(
     request: Request,
     env: Env,
     ctx: ExecutionContext
   ): Promise<Response> {
+    if (!whatsappConfigDiagnosticsLogged) {
+      console.info("[WHATSAPP_CONFIG]", {
+        hasPhoneNumberId: Boolean(env.PHONE_NUMBER_ID?.trim()),
+        hasWhatsAppToken: Boolean(env.WHATSAPP_TOKEN?.trim()),
+        hasAppSecret: Boolean(env.WHATSAPP_APP_SECRET?.trim()),
+      });
+      whatsappConfigDiagnosticsLogged = true;
+    }
+
     const origin = request.headers.get("Origin");
     const allowedOrigins = [
       "http://localhost:5173",

@@ -81,7 +81,7 @@ const mappedOrders = (Array.isArray(ordersData) ? ordersData : []).map(
           : order.customer_phone || 'Unknown customer'),
       product: order.product_name || 'Product details unavailable',
       quantity: order.quantity ?? 1,
-      source: 'WhatsApp',
+      source: order.payment_provider === 'manual' ? 'Manual' : 'WhatsApp',
       date: formatDate(order.created_at),
       amount: formatAmount(order),
       status: normalizeStatus(order.status),

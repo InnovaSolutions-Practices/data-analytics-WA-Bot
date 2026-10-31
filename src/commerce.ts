@@ -452,6 +452,7 @@ export type DeliveryCustomerResponse = 'AWAITING' | 'YES' | 'NO';
 export interface DeliveryAddressRecord {
   id: number;
   customer_id: number;
+  profile_name: string;
   recipient_name: string;
   recipient_phone: string;
   email: string | null;
@@ -461,11 +462,14 @@ export interface DeliveryAddressRecord {
   state: string;
   pincode: string;
   landmark: string | null;
+  is_default?: boolean;
+  is_active?: boolean;
   created_at: string;
   updated_at: string;
 }
 
 export interface DeliveryAddressInput {
+  profile_name?: string | null;
   recipient_name: string;
   recipient_phone: string;
   email?: string | null;
@@ -485,6 +489,105 @@ export interface OrderDeliveryDetailsRecord {
   delivery_status: DeliveryStatus;
   created_at: string;
   updated_at: string;
+}
+
+export interface DeliveryAddressParseResult {
+  isStructured: boolean;
+  address: DeliveryAddressInput | null;
+  missingFields: string[];
+  validationError: string | null;
+}
+
+const DELIVERY_ADDRESS_FIELD_LABELS: Record<string, keyof DeliveryAddressInput> = {
+  name: 'recipient_name',
+  'recipient name': 'recipient_name',
+  recipient: 'recipient_name',
+  phone: 'recipient_phone',
+  mobile: 'recipient_phone',
+  'phone number': 'recipient_phone',
+  'mobile number': 'recipient_phone',
+  email: 'email',
+  address: 'address_line_1',
+  'address line': 'address_line_1',
+  'address line 1': 'address_line_1',
+  'address line 2': 'address_line_2',
+  city: 'city',
+  state: 'state',
+  pincode: 'pincode',
+  'pin code': 'pincode',
+  'postal code': 'pincode',
+  landmark: 'landmark',
+};
+
+const REQUIRED_DELIVERY_ADDRESS_FIELDS: Array<{
+  field: keyof DeliveryAddressInput;
+  label: string;
+}> = [
+  { field: 'recipient_name', label: 'Name' },
+  { field: 'recipient_phone', label: 'Phone' },
+  { field: 'address_line_1', label: 'Address' },
+  { field: 'city', label: 'City' },
+  { field: 'state', label: 'State' },
+  { field: 'pincode', label: 'Pincode' },
+];
+
+export function parseDeliveryAddressMessage(message: string): DeliveryAddressParseResult {
+  const parsed: Partial<Record<keyof DeliveryAddressInput, string>> = {};
+  let recognizedFields = 0;
+
+  for (const line of message.split(/\r?\n/)) {
+    const separator = line.indexOf(':');
+    if (separator < 1) continue;
+
+    const label = line.slice(0, separator).trim().toLowerCase().replace(/\s+/g, ' ');
+    const field = DELIVERY_ADDRESS_FIELD_LABELS[label];
+    if (!field) continue;
+
+    parsed[field] = line.slice(separator + 1).trim();
+    recognizedFields += 1;
+  }
+
+  const isStructured = recognizedFields >= 2;
+  if (!isStructured) {
+    return { isStructured: false, address: null, missingFields: [], validationError: null };
+  }
+
+  const missingFields = REQUIRED_DELIVERY_ADDRESS_FIELDS
+    .filter(({ field }) => !parsed[field]?.trim())
+    .map(({ label }) => label);
+
+  if (missingFields.length) {
+    return { isStructured: true, address: null, missingFields, validationError: null };
+  }
+
+  const candidate: DeliveryAddressInput = {
+    recipient_name: parsed.recipient_name!,
+    recipient_phone: parsed.recipient_phone!,
+    address_line_1: parsed.address_line_1!,
+    city: parsed.city!,
+    state: parsed.state!,
+    pincode: parsed.pincode!,
+    email: parsed.email || null,
+    address_line_2: parsed.address_line_2 || null,
+    landmark: parsed.landmark || null,
+  };
+
+  try {
+    const address = validateDeliveryAddress(candidate);
+    return {
+      isStructured: true,
+      address: { ...address, profile_name: address.recipient_name },
+      missingFields: [],
+      validationError: null,
+    };
+  } catch (error) {
+    return {
+      isStructured: true,
+      address: null,
+      missingFields: [],
+      validationError: error instanceof Error ? error.message : 'Delivery address is invalid.',
+    };
+  }
 }
 
 export function validateDeliveryAddress(input: DeliveryAddressInput): DeliveryAddressInput {
@@ -526,8 +629,15 @@ export function validateDeliveryAddress(input: DeliveryAddressInput): DeliveryAd
     return normalized || null;
   };
 
+  const recipientName = requiredText(input.recipient_name, 'Recipient name', 100);
+  const profileName = input.profile_name?.trim() || recipientName || 'Primary Address';
+  if (profileName.length > 100) {
+    throw new Error('Address profile name must be 100 characters or fewer');
+  }
+
   return {
-    recipient_name: requiredText(input.recipient_name, 'Recipient name', 100),
+    profile_name: profileName,
+    recipient_name: recipientName,
     recipient_phone: recipientPhone,
     email,
     address_line_1: requiredText(input.address_line_1, 'Address', 500),
@@ -678,25 +788,34 @@ export async function updateOrderStatus(
     throw new Error(`Order status history insert failed: ${historyError.message}`);
   }
 
-  const { error: notificationError } = await client
-    .from('notification_events')
-    .insert({
-      order_id: orderId,
-      customer_phone: String(existingOrder.customer_phone),
-      event_type: 'order_status_changed',
-      channel: 'whatsapp',
-      status: 'queued',
-      related_status: nextStatus,
-      payload: {
+  try {
+    const { error: notificationError } = await client
+      .from('notification_events')
+      .insert({
         order_id: orderId,
-        previous_status: previousStatus,
-        new_status: nextStatus,
-      },
-      reason: options.reason ?? null,
-    });
+        customer_phone: String(existingOrder.customer_phone),
+        event_type: 'order_status_changed',
+        channel: 'whatsapp',
+        status: 'queued',
+        related_status: nextStatus,
+        payload: {
+          order_id: orderId,
+          previous_status: previousStatus,
+          new_status: nextStatus,
+        },
+        reason: options.reason ?? null,
+      });
 
-  if (notificationError) {
-    throw new Error(`Notification event insert failed: ${notificationError.message}`);
+    if (notificationError) {
+      throw new Error(notificationError.message);
+    }
+  } catch (error) {
+    console.error('[NOTIFICATION_ERROR]', {
+      orderId,
+      status: nextStatus,
+      stage: 'queue_event',
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
 
   return updatedOrder as OrderRecord;
@@ -1344,15 +1463,7 @@ export async function saveDeliveryAddressForOrder(
     }
   }
 
-  const { data: address, error: addressError } = await client
-    .from('delivery_addresses')
-    .insert({ ...addressInput, customer_id: customerId })
-    .select('*')
-    .single();
-
-  if (addressError || !address) {
-    throw new Error(`Delivery address creation failed: ${addressError?.message ?? 'Unknown error'}`);
-  }
+  const address = await saveDeliveryAddressForCustomer(customerId, addressInput, env);
 
   const { data: delivery, error: deliveryError } = await client
     .from('order_delivery_details')
@@ -1420,6 +1531,133 @@ export async function getCustomerDeliveryAddresses(
   }
 
   return (data as DeliveryAddressRecord[]) ?? [];
+}
+
+export async function saveDeliveryAddressForCustomer(
+  customerId: number,
+  input: DeliveryAddressInput,
+  env: RAGEnv,
+  updateAddressId?: number
+): Promise<DeliveryAddressRecord> {
+  const addressInput = validateDeliveryAddress(input);
+  const client = getAdminClient(env);
+  const values = {
+      ...addressInput,
+      profile_name: addressInput.profile_name || addressInput.recipient_name || 'Primary Address',
+      customer_id: customerId,
+      is_active: true,
+    };
+  const query = updateAddressId
+    ? client
+      .from('delivery_addresses')
+      .update(values)
+      .eq('id', updateAddressId)
+      .eq('customer_id', customerId)
+    : client
+      .from('delivery_addresses')
+      .insert({
+        ...values,
+        is_default: false,
+      });
+  const { data, error } = await query.select('*').single();
+
+  if (error || !data) {
+    throw new Error(
+      `${updateAddressId ? 'Delivery address update' : 'Delivery address creation'} failed: ${error?.message ?? 'Address not found'}`
+    );
+  }
+
+  return data as DeliveryAddressRecord;
+}
+
+export async function linkSavedDeliveryAddressToOrder(
+  orderId: number,
+  customerPhone: string,
+  addressId: number,
+  env: RAGEnv
+): Promise<{ address: DeliveryAddressRecord; delivery: OrderDeliveryDetailsRecord }> {
+  const client = getAdminClient(env);
+  const { data: order, error: orderError } = await client
+    .from('orders')
+    .select('id, customer_id, customer_phone')
+    .eq('id', orderId)
+    .eq('customer_phone', customerPhone)
+    .maybeSingle();
+
+  if (orderError || !order) {
+    throw new Error(`Delivery order lookup failed: ${orderError?.message ?? 'Order not found for this customer'}`);
+  }
+
+  let customerId = order.customer_id as number | null;
+  if (customerId === null) {
+    const customer = await upsertCustomer(String(order.customer_phone), env);
+    customerId = customer.id;
+    const { error: customerLinkError } = await client
+      .from('orders')
+      .update({ customer_id: customerId })
+      .eq('id', orderId)
+      .is('customer_id', null);
+    if (customerLinkError) {
+      throw new Error(`Order customer link update failed: ${customerLinkError.message}`);
+    }
+  }
+
+  const { data: address, error: addressError } = await client
+    .from('delivery_addresses')
+    .select('*')
+    .eq('id', addressId)
+    .eq('customer_id', customerId)
+    .maybeSingle();
+
+  if (addressError || !address || address.is_active === false) {
+    throw new Error(`Saved delivery address lookup failed: ${addressError?.message ?? 'Active address not found for this customer'}`);
+  }
+
+  const currentDelivery = await ensurePendingOrderDelivery(orderId, env);
+  if (currentDelivery.delivery_address_id === addressId) {
+    return {
+      address: address as DeliveryAddressRecord,
+      delivery: currentDelivery,
+    };
+  }
+  if (currentDelivery.delivery_address_id !== null) {
+    throw new Error('A different delivery address is already linked to this order');
+  }
+  if (currentDelivery.delivery_status !== 'PENDING_DETAILS') {
+    throw new Error(`Delivery details cannot be changed from status ${currentDelivery.delivery_status}`);
+  }
+
+  const { data: delivery, error: deliveryError } = await client
+    .from('order_delivery_details')
+    .update({
+      delivery_address_id: addressId,
+      customer_response: 'YES',
+      delivery_status: 'DETAILS_RECEIVED',
+    })
+    .eq('order_id', orderId)
+    .eq('delivery_status', 'PENDING_DETAILS')
+    .is('delivery_address_id', null)
+    .select('*')
+    .maybeSingle();
+
+  if (deliveryError) {
+    throw new Error(`Order delivery update failed: ${deliveryError.message}`);
+  }
+  if (delivery) {
+    return {
+      address: address as DeliveryAddressRecord,
+      delivery: delivery as OrderDeliveryDetailsRecord,
+    };
+  }
+
+  const latestDelivery = await getOrderDeliveryDetails(orderId, env);
+  if (latestDelivery?.delivery_address_id === addressId) {
+    return {
+      address: address as DeliveryAddressRecord,
+      delivery: latestDelivery,
+    };
+  }
+  throw new Error('Order delivery details changed before the saved address could be linked');
 }
 
 const DELIVERY_STATUS_TRANSITIONS: Record<DeliveryStatus, readonly DeliveryStatus[]> = {

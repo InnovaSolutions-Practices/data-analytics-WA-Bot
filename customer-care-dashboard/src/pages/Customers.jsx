@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { getOrders } from '../data/orderStore'
-import { getCustomers } from '../api/customerApi'
+import { createCustomer, getCustomers } from '../api/customerApi'
 function formatPhone(phone) {
   if (!phone) return '—'
 
@@ -17,13 +16,6 @@ function formatPhone(phone) {
 
   return `+${digits}`
 }
-const initialCustomers = [
-  { id: '1', name: 'Rahul', phone: '+91 98765 43210', status: 'Active', lastOrder: '#ORD-1001' },
-  { id: '2', name: 'Priya', phone: '+91 98765 12345', status: 'Active', lastOrder: '#ORD-1002' },
-  { id: '3', name: 'Arun', phone: '+91 91234 56789', status: 'Active', lastOrder: '#ORD-1003' },
-  { id: '4', name: 'Sneha', phone: '+91 99887 66554', status: 'Active', lastOrder: '#ORD-1004' },
-]
-
 function Customers() {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
@@ -33,18 +25,10 @@ function Customers() {
   const [error, setError] = useState('')
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState('all')
-  const [showAddForm, setShowAddForm] = useState(
-    searchParams.get('add') === 'true'
-  )
-  const [savedCustomers, setSavedCustomers] = useState(() => {
-    try {
-      return JSON.parse(
-        localStorage.getItem('customer_care_customers') || '{}'
-      )
-    } catch {
-      return {}
-    }
-  })
+  const showAddForm = searchParams.get('add') === 'true'
+  const [savingCustomer, setSavingCustomer] = useState(false)
+  const [formError, setFormError] = useState('')
+  const [successMessage, setSuccessMessage] = useState('')
 
   const [newCustomer, setNewCustomer] = useState({
     name: '',
@@ -60,7 +44,7 @@ useEffect(() => {
       setError('')
 
       const data = await getCustomers()
-      setCustomers(data)
+      setCustomers(Array.isArray(data) ? data : [])
     } catch (err) {
       console.error('Failed to load customers:', err)
       setError(err.message || 'Failed to load customers')
@@ -73,17 +57,13 @@ useEffect(() => {
 }, [])
 
 
-  useEffect(() => {
-    setShowAddForm(searchParams.get('add') === 'true')
-  }, [searchParams])
-
   const closeForm = () => {
-    setShowAddForm(false)
     setSearchParams({})
     setNewCustomer({ name: '', phone: '', email: '' })
+    setFormError('')
   }
 
-  const handleSaveCustomer = (event) => {
+  const handleSaveCustomer = async (event) => {
     event.preventDefault()
 
     const name = newCustomer.name.trim()
@@ -91,74 +71,43 @@ useEffect(() => {
     const email = newCustomer.email.trim()
 
     if (!name || !phone) {
-      alert('Please enter the customer name and phone number.')
+      setFormError('Please enter the customer name and phone number.')
       return
     }
 
     const digits = phone.replace(/\D/g, '')
     if (digits.length < 10 || digits.length > 15) {
-      alert('Please enter a valid phone number.')
+      setFormError('Please enter a valid phone number.')
       return
     }
 
-    const duplicatePhone = [
-      ...initialCustomers,
-      ...Object.values(savedCustomers),
-    ].some(
-      (customer) =>
-        customer.phone?.replace(/\D/g, '') === digits
-    )
+    try {
+      setSavingCustomer(true)
+      setFormError('')
+      setSuccessMessage('')
+      const createdCustomer = await createCustomer({
+        customer_name: name,
+        whatsapp_number: phone,
+        email: email || undefined,
+      })
+      setCustomers((previous) => [createdCustomer, ...previous])
+      closeForm()
+      setSuccessMessage('Customer created successfully.')
 
-    if (duplicatePhone) {
-      alert('A customer with this phone number already exists.')
-      return
+      try {
+        const refreshedCustomers = await getCustomers()
+        setCustomers(Array.isArray(refreshedCustomers) ? refreshedCustomers : [createdCustomer])
+      } catch (refreshError) {
+        console.error('Customer was created, but refreshing the list failed:', refreshError)
+        setSuccessMessage('Customer created successfully. The list refresh failed; the saved customer is still shown.')
+      }
+    } catch (err) {
+      console.error('Failed to create customer:', err)
+      setFormError(err.message || 'Could not create customer.')
+    } finally {
+      setSavingCustomer(false)
     }
-
-    // Temporary local demo record.
-    // The backend will assign the real Customer ID later.
-    const recordKey = `manual-${Date.now()}`
-    const updatedCustomers = {
-      ...savedCustomers,
-      [recordKey]: {
-        name,
-        phone,
-        email,
-        status: 'Active',
-        lastOrder: '—',
-        customerId: null,
-        pendingBackendCreation: true,
-      },
-    }
-
-    localStorage.setItem(
-      'customer_care_customers',
-      JSON.stringify(updatedCustomers)
-    )
-
-    setSavedCustomers(updatedCustomers)
-    closeForm()
-    alert(
-      'Customer saved locally for demo. It has not been created in the backend yet.'
-    )
   }
-
-  
-const allCustomers = [
-  ...initialCustomers.map((customer) => ({
-    ...customer,
-    ...(savedCustomers[customer.id] || {}),
-    id: customer.id,
-  })),
-
-  ...Object.entries(savedCustomers)
-    .filter(
-      ([key]) => !initialCustomers.some((customer) => customer.id === key)
-    )
-    .map(([key, customer]) => ({
-      ...customer,
-      id: key,
-    })),
-]
 
 const customerData = customers.map((customer) => ({
   ...customer,
@@ -191,6 +140,10 @@ const customerData = customers.map((customer) => ({
 
   return (
     <div className="customers-page">
+      {successMessage && (
+        <p role="status" className="success-message">{successMessage}</p>
+      )}
+      {error && <p role="alert" className="error-message">{error}</p>}
       <div className="page-heading">
         <div>
           <h2>Customers</h2>
@@ -237,6 +190,8 @@ const customerData = customers.map((customer) => ({
                 ×
               </button>
             </div>
+
+            {formError && <p role="alert" className="error-message">{formError}</p>}
 
             <label>
               Customer Name <span>*</span>
@@ -295,8 +250,8 @@ const customerData = customers.map((customer) => ({
               >
                 Cancel
               </button>
-              <button type="submit" className="save-customer-btn">
-                Save Customer
+              <button type="submit" className="save-customer-btn" disabled={savingCustomer}>
+                {savingCustomer ? 'Saving...' : 'Save Customer'}
               </button>
             </div>
           </form>
@@ -326,7 +281,19 @@ const customerData = customers.map((customer) => ({
             </thead>
 
             <tbody>
-              {filteredCustomers.length > 0 ? (
+              {loading ? (
+                <tr>
+                  <td colSpan="7" style={{ textAlign: 'center', padding: '30px' }}>
+                    Loading customers...
+                  </td>
+                </tr>
+              ) : error ? (
+                <tr>
+                  <td colSpan="7" style={{ textAlign: 'center', padding: '30px' }}>
+                    Customers could not be loaded.
+                  </td>
+                </tr>
+              ) : filteredCustomers.length > 0 ? (
                 filteredCustomers.map((customer) => (
                   <tr key={customer.id}>
                     <td>

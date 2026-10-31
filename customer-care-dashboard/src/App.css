@@ -1818,6 +1818,65 @@
   outline: none;
 }
 
+.customer-form-modal select,
+.customer-form-modal textarea {
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  font: inherit;
+  background: #fff;
+}
+
+.customer-form-modal textarea {
+  min-height: 84px;
+  resize: vertical;
+}
+
+.crm-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.crm-history-list {
+  display: grid;
+  gap: 10px;
+}
+
+.crm-history-entry {
+  display: grid;
+  gap: 5px;
+  padding: 14px 16px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.crm-history-entry span {
+  color: #6b7280;
+  font-size: 0.875rem;
+}
+
+.crm-history-entry p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.success-message {
+  color: #166534;
+}
+
+.error-message {
+  color: #b91c1c;
+}
+
+@media (max-width: 640px) {
+  .crm-form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .customer-form-modal input:focus {
   border-color: #2563eb;
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);

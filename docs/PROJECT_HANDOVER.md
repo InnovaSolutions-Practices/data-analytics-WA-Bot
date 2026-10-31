@@ -679,13 +679,16 @@ No active orders found.
 
 ### Tracking status messages
 
-Customer-facing lifecycle messages include:
+When an admin changes an order status in the dashboard, the status API persists the transition and history, queues a notification event, and attempts a WhatsApp text message for these statuses:
 
-- `paid`: `✅ Payment received.`
-- `PACKED`: `📦 Order packed and awaiting shipment.`
-- `SHIPPED`: `🚚 Order shipped.`
-- `OUT_FOR_DELIVERY`: `🛵 Out for delivery.`
-- `DELIVERED`: `✅ Delivered successfully.`
+- `pending` / `paid` (`ORDER_PLACED`): `Your order #{{orderId}} has been placed successfully.`
+- `PACKED` (`PROCESSING`): `Your order #{{orderId}} is now being processed.`
+- `SHIPPED`: `Your order #{{orderId}} has been shipped.`
+- `OUT_FOR_DELIVERY`: `Your order #{{orderId}} is out for delivery.`
+- `DELIVERED` / legacy `fulfilled`: `Your order #{{orderId}} has been delivered.`
+- `cancelled`: `Your order #{{orderId}} has been cancelled.`
+
+Messages include the customer's name and a human-readable current status. Customer lookup uses `orders.customer_id -> customers.id` with `orders.customer_phone -> customers.whatsapp_number` as a fallback. The admin order list returns `customer_name` for the Tracking page.
 
 Legacy statuses are mapped to readable labels such as `Awaiting payment`, `Payment setup failed`, `Cancelled`, and `Completed`.
 
@@ -885,17 +888,32 @@ The chat model defaults to `gpt-4o-mini`, overridable with `OPENAI_CHAT_MODEL`. 
 
 The active checkout route uses `commerce.createOrderFromCart()`.
 
-It:
+Checkout collects or selects a delivery address before creating an order:
 
-- Finds the active cart by phone.
-- Reads cart items.
-- Calculates subtotal.
-- Inserts an order with status `pending`.
-- Inserts order items.
-- Marks the cart `checked_out`.
-- Reloads order items.
+- `CHECKOUT_CART` loads the customer's active saved addresses from `delivery_addresses`.
+- If an address exists, the customer can use it or add a new one. Otherwise, checkout asks for a new address.
+- Add New Address launches the WhatsApp Flow defined in `whatsapp-flows/delivery-address-flow.json`; its published Meta Flow must be named `Delivery Address`.
+- The Worker reads the Flow ID from `WHATSAPP_DELIVERY_FLOW_ID`. Configure it in local `.dev.vars` for development and as a Worker environment variable for deployed environments.
+- The Flow returns structured JSON in the inbound `interactive.nfm_reply.response_json` webhook. The Worker validates it and creates a delivery-address row, or updates a row only when an address ID was set in trusted conversation context.
+- The checkout Flow launch does not automatically switch to text address collection. Missing Flow configuration or a failed Meta launch is logged and reported without sending the address text template. A customer text reply while the Flow is open does not switch collection modes.
+- The Flow includes an address review/confirmation screen. After submission, the Worker persists and links the address, then sends the order/payment confirmation without asking follow-up address questions.
+- Address inserts always set `profile_name` to the supplied profile name, recipient name, or `Primary Address`.
+- Checkout creates/updates the address, creates the order and order items, initializes `order_delivery_details`, then creates and sends the payment link.
+- Address selection is restricted to active addresses owned by the order's customer.
 
 There is no database transaction spanning these operations.
+
+The post-payment delivery-details flow remains available for legacy orders without a linked address and uses the same address choice, Flow form, and validation. Legacy persisted text-form states are redirected to the native Flow; text-based address collection is disabled.
+
+### Publishing the delivery Flow in Meta
+
+1. Use WhatsApp Manager's Flow tools or the Meta Flows API with the WhatsApp Business Account ID and a token authorized for that account.
+2. Create and publish a Flow named `Delivery Address`, with category `OTHER`, using the contents of `whatsapp-flows/delivery-address-flow.json` as the `flow_json` parameter. The API create operation accepts `name`, `categories`, `flow_json`, and `publish: true`.
+3. Check the API result for validation errors and retain the returned Flow `id`.
+4. Set `WHATSAPP_DELIVERY_FLOW_ID` to that ID in local `.dev.vars` and as a secret/variable for the deployed Worker environment.
+5. Ensure the WhatsApp Business account is eligible to send Flows and the Cloud API message permissions are configured. Then exercise the form using a real WhatsApp client.
+
+This Flow uses a client-side `complete` action and does not use a Flow data endpoint, so it requires no Flow endpoint encryption key or additional endpoint deployment.
 
 ### Payment statuses
 
@@ -945,14 +963,18 @@ Added by migration `006`:
 
 ### Order notifications
 
-Order status notifications are currently configured for:
+Order status notifications are configured for:
 
+- `pending` / `paid`
 - `PACKED`
 - `SHIPPED`
 - `OUT_FOR_DELIVERY`
 - `DELIVERED`
+- `cancelled`
 
-The notification helper finds the queued event, sends through the common WhatsApp sender, updates it to `sent` with `sent_at`, or marks it `failed` with a reason. It logs lookup, send, Meta result, and state update details.
+The notification helper resolves the customer, sends through the common WhatsApp Cloud API sender, and updates the queued event to `sent` with `sent_at` or `failed` with a reason. A `sent` event means Meta accepted the API request; it does not prove delivery to the customer's device. Notification failures are logged and do not roll back an already-persisted order status. Structured `[STATUS_UPDATE]`, `[NOTIFICATION]`, and `[NOTIFICATION_ERROR]` logs are emitted; phone numbers are masked in logs.
+
+The `POST /webhook` handler also processes WhatsApp message-status callbacks. It logs `sent`, `delivered`, `read`, and `failed` updates with the Meta message ID and masked recipient, and matches callbacks to notification events using `payload.meta_message_id`. The latest callback state, timestamp, and sanitized error details are retained in the event payload. These callbacks are verified using `X-Hub-Signature-256`; configure the WhatsApp app secret as `WHATSAPP_APP_SECRET` before enabling delivery-status receipt. The Meta app must subscribe the WhatsApp webhook to the `messages` field for these callbacks to arrive.
 
 ## 7. Razorpay Integration
 
@@ -1489,7 +1511,7 @@ These are not ticket creation categories:
 
 29. **Tests are starter tests:** They cover `/message`, `/random`, and RAG helper behavior, not commerce or support flows.
 30. **No Supabase integration tests:** Database constraints, RLS, migrations, and RPCs are not tested in CI.
-31. **No WhatsApp contract tests:** Meta payload parsing and outbound payloads are not systematically tested.
+31. **Limited WhatsApp contract tests:** Flow launch and completion payloads have focused unit coverage, but other Meta webhook and outbound message payloads are not systematically tested.
 32. **No admin API tests:** Authentication, 404/400 behavior, status transitions, notifications, and replies lack automated coverage.
 33. **No migration command in `package.json`:** Migrations must be applied externally.
 34. **Static UI is still Cloudflare starter content.**
@@ -1702,7 +1724,7 @@ Before deployment:
 1. Confirm production secrets are configured.
 2. Confirm Meta callback URL points to the deployed Worker hostname and `/webhook` path.
 3. Confirm Meta WhatsApp `messages` subscription is enabled.
-4. Apply Supabase migrations `001` through `009` in order, using the actual production schema as the source of truth.
+4. Apply Supabase migrations `001` through `017` in order, using the actual production schema as the source of truth.
 5. Confirm Razorpay webhook points to `/razorpay-webhook`.
 6. Test GET webhook verification.
 7. Test an inbound WhatsApp message and inspect Worker tail logs.
@@ -1724,7 +1746,27 @@ Recommended migration order:
 007_support_tickets.sql
 008_ticket_messages.sql
 009_ticket_message_media.sql
+010_support_sessions.sql
+011_support_session_media.sql
+012_support_agent_chat.sql
+013_commerce_memory.sql
+014_support_agent_sessions.sql
+015_delivery_addresses.sql
+016_admin_crm_orders.sql
+017_fix_manual_order_delivery_address.sql
 ```
+
+Migration 017 updates `public.create_admin_order` for delivery-address schemas
+that require `profile_name` and track `is_default`/`is_active`. It defaults a
+manually created order address to the profile name `Delivery`, inactive-default
+state, and active state.
+
+### Admin CRM workflow
+
+- `POST /api/admin/customers` creates a customer from `customer_name`, `whatsapp_number`, and optional `email`. It normalizes ten-digit Indian numbers and rejects duplicate phone numbers.
+- `POST /api/admin/customers/:id/orders` creates an order through `public.create_admin_order`. The migration-backed function writes the order, order item, initial status-history entry, delivery address, and delivery record in one database transaction.
+- `GET /api/admin/customers/:id/history` loads order lines/status history, delivery details, support messages/sessions, conversation state/context, and notification events for the customer profile.
+- The order creation function requires an active product, a valid customer, a positive quantity, a non-negative unit price, a supported initial status, and a complete delivery address with a six-digit pincode.
 
 ### Meta WhatsApp setup
 

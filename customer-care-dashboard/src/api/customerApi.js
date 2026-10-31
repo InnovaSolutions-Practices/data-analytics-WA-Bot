@@ -1,16 +1,9 @@
 
-const BASE_URL = 'https://whatsapp-bot.whatsbot.workers.dev'
-
-// Local testing only. Never commit your token to GitHub.
-const TOKEN = 'innova-admin-2026-secret'
-
-
 async function apiFetch(path, options = {}) {
-  const response = await fetch(`${BASE_URL}${path}`, {
+  const response = await fetch(path, {
     ...options,
     method: options.method || 'GET',
     headers: {
-      Authorization: `Bearer ${TOKEN}`,
       'Content-Type': 'application/json',
       ...options.headers,
     },
@@ -18,12 +11,15 @@ async function apiFetch(path, options = {}) {
 
   const text = await response.text()
 
-  console.log('API URL:', `${BASE_URL}${path}`)
-  console.log('API Status:', response.status)
-  console.log('API Response:', text)
-
   if (!response.ok) {
-    throw new Error(text || `API request failed: ${response.status}`)
+    let message = text || `API request failed: ${response.status}`
+    try {
+      const body = JSON.parse(text)
+      message = body.error || message
+    } catch {
+      // Use the raw response when the server does not return JSON.
+    }
+    throw new Error(message)
   }
 
   try {
@@ -41,9 +37,23 @@ export async function getCustomers() {
   return data.customers
 }
 
+export async function createCustomer(customer) {
+  const data = await apiFetch('/api/admin/customers', {
+    method: 'POST',
+    body: JSON.stringify(customer),
+  })
+
+  return data.customer
+}
+
 export async function getCustomerById(customerId) {
   const data = await apiFetch(`/api/admin/customers/${customerId}`)
   return data.customer ?? data
+}
+
+export async function getCustomerHistory(customerId) {
+  const data = await apiFetch(`/api/admin/customers/${customerId}/history`)
+  return data.history
 }
 
 export async function getCustomerOrders(customerId) {
@@ -55,6 +65,15 @@ export async function getCustomerOrders(customerId) {
   if (Array.isArray(data.orders)) return data.orders
 
   return []
+}
+
+export async function createCustomerOrder(customerId, order) {
+  const data = await apiFetch(`/api/admin/customers/${customerId}/orders`, {
+    method: 'POST',
+    body: JSON.stringify(order),
+  })
+
+  return data
 }
 
 export async function updateCustomer(customerId, updates) {

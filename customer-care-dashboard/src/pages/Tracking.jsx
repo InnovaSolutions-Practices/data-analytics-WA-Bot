@@ -6,61 +6,6 @@ import {
 
 
 
-const statusOptions = [
-  'Pending',
-  'Processing',
-  'Shipped',
-  'In Transit',
-  'Delivered',
-]
-
-const trackingInfo = {
-  '1001': {
-    trackingId: 'TRK-784512',
-    phone: '+91 98765 43210',
-  },
-  '1002': {
-    trackingId: 'TRK-784513',
-    phone: '+91 98765 12345',
-  },
-  '1003': {
-    trackingId: 'TRK-784514',
-    phone: '+91 91234 56789',
-  },
-  '1004': {
-    trackingId: 'TRK-784515',
-    phone: '+91 99887 66554',
-  },
-  '1005': {
-    trackingId: 'TRK-784516',
-    phone: '+91 90000 11111',
-  },
-}
-
-function createTimeline(order) {
-  const statuses = [
-    'Order Placed',
-    'Processing',
-    'Shipped',
-    'In Transit',
-    'Delivered',
-  ]
-
-  const history = order.trackingHistory || []
-
-  return statuses.map((status) => {
-    const historyItem = history.find(
-      (item) => item.status === status
-    )
-
-    return {
-      status,
-      date: historyItem?.date || '--',
-      completed: Boolean(historyItem),
-      active: order.status === status,
-    }
-  })
-}
 const allowedTransitions = {
   pending: ['payment_pending', 'paid', 'failed', 'cancelled'],
   payment_pending: ['paid', 'failed', 'cancelled'],
@@ -86,6 +31,25 @@ const statusLabels = {
   OUT_FOR_DELIVERY: 'In Transit',
   DELIVERED: 'Delivered',
 }
+
+function createTimeline(order) {
+  const history = Array.isArray(order.status_history)
+    ? order.status_history
+    : []
+  const entries = history.length
+    ? history
+    : [{ new_status: order.status, created_at: order.created_at }]
+
+  return entries.map((entry) => ({
+    status: statusLabels[entry.new_status] || entry.new_status || 'Order Placed',
+    date: entry.created_at
+      ? new Date(entry.created_at).toLocaleString('en-IN')
+      : '--',
+    completed: true,
+    active: entry.new_status === order.status,
+  }))
+}
+
 function Tracking() {
   const [orders, setOrders] = useState([])
   const [search, setSearch] = useState('')
@@ -103,6 +67,7 @@ function Tracking() {
         customer: order.customer_name || order.customer || 'Unknown customer',
         product: order.product_name || 'Product not recorded',
         status: order.status || 'Pending',
+        status_history: order.status_history || [],
       }))
 
       setOrders(formattedOrders)
@@ -122,12 +87,8 @@ function Tracking() {
   const filteredOrders = orders.filter((order) => {
     const searchText = search.toLowerCase().trim()
 
-    const trackingId =
-      trackingInfo[order.id.replace('#ORD-', '')]?.trackingId || ''
-
     return (
       order.id.toLowerCase().includes(searchText) ||
-      trackingId.toLowerCase().includes(searchText) ||
       order.customer.toLowerCase().includes(searchText)
     )
   })
@@ -159,14 +120,18 @@ const handleStatusUpdate = async () => {
     setOrders((previousOrders) =>
       previousOrders.map((order) =>
         order.id === selectedOrder.id
-          ? { ...order, status: savedStatus }
+          ? {
+              ...order,
+              status: savedStatus,
+              status_history: result.timeline ?? order.status_history,
+            }
           : order
       )
     )
 
     setSelectedOrder((previous) =>
       previous
-        ? { ...previous, status: savedStatus }
+        ? { ...previous, status: savedStatus, status_history: result.timeline ?? previous.status_history }
         : previous
     )
 
@@ -192,7 +157,7 @@ const handleStatusUpdate = async () => {
       <div className="tracking-toolbar">
         <input
           type="text"
-          placeholder="Search by order ID, tracking ID or customer..."
+          placeholder="Search by order ID or customer..."
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
@@ -261,13 +226,6 @@ const handleStatusUpdate = async () => {
                 </p>
               </div>
 
-              <span className="tracking-id">
-                {
-                  trackingInfo[
-                    selectedOrder.id.replace('#ORD-', '')
-                  ]?.trackingId
-                }
-              </span>
             </div>
 
             {/* Update Status */}

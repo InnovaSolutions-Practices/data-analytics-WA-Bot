@@ -4,6 +4,8 @@ SUPABASE_SERVICE_ROLE_KEY=
 
 WHATSAPP_TOKEN=
 PHONE_NUMBER_ID=
+WHATSAPP_APP_SECRET=
+WHATSAPP_DELIVERY_FLOW_ID=
 
 RAZORPAY_KEY_ID=
 RAZORPAY_KEY_SECRET=
@@ -13,6 +15,9 @@ OPENAI_API_KEY=
 # Optional, defaults shown
 OPENAI_CHAT_MODEL=gpt-4o-mini
 RAG_MATCH_THRESHOLD=0.75
+
+# Admin API for customer-care dashboard requests.
+ADMIN_API_TOKEN=dev-admin-token
 
 # Human support number for the "Connect to Agent" WhatsApp direct-chat CTA.
 # International format, digits only (no +, spaces, or leading 00).

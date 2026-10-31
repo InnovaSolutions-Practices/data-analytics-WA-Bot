@@ -7,6 +7,7 @@ type QueryResult = {
 
 const supabaseMock = vi.hoisted(() => ({
   inserts: [] as Array<{ table: string; values: unknown }>,
+  updates: [] as Array<{ table: string; values: unknown }>,
   createClient: vi.fn(),
 }));
 
@@ -14,7 +15,10 @@ vi.mock('@supabase/supabase-js', () => ({
   createClient: supabaseMock.createClient,
 }));
 
-import { createOrderFromCart } from '../src/commerce';
+import {
+  createOrderFromCart,
+  saveDeliveryAddressForCustomer,
+} from '../src/commerce';
 
 const customer = {
   id: 73,
@@ -89,6 +93,26 @@ function createQuery(table: string) {
       };
       return { data: order, error: null };
     }
+    if (table === 'delivery_addresses' && operation === 'insert') {
+      return {
+        data: {
+          id: 99,
+          customer_id: 73,
+          ...(values as Record<string, unknown>),
+        },
+        error: null,
+      };
+    }
+    if (table === 'delivery_addresses' && operation === 'update') {
+      return {
+        data: {
+          id: 99,
+          customer_id: 73,
+          ...(values as Record<string, unknown>),
+        },
+        error: null,
+      };
+    }
     if (table === 'order_items' && operation === 'select') {
       return { data: orderItems, error: null };
     }
@@ -107,8 +131,10 @@ function createQuery(table: string) {
     supabaseMock.inserts.push({ table, values: insertValues });
     return query;
   };
-  query.update = () => {
+  query.update = (updateValues: unknown) => {
     operation = 'update';
+    values = updateValues;
+    supabaseMock.updates.push({ table, values: updateValues });
     return query;
   };
   query.then = (
@@ -122,6 +148,7 @@ function createQuery(table: string) {
 describe('createOrderFromCart', () => {
   beforeEach(() => {
     supabaseMock.inserts = [];
+    supabaseMock.updates = [];
     supabaseMock.createClient.mockImplementation(() => ({
       from(table: string) {
         return createQuery(table);
@@ -159,5 +186,71 @@ describe('createOrderFromCart', () => {
     });
     expect(result.order.customer_id).toBe(customer.id);
     expect(result.orderItems).toEqual(orderItems);
+  });
+});
+
+describe('saveDeliveryAddressForCustomer', () => {
+  beforeEach(() => {
+    supabaseMock.inserts = [];
+    supabaseMock.updates = [];
+    supabaseMock.createClient.mockImplementation(() => ({
+      from(table: string) {
+        return createQuery(table);
+      },
+    }));
+  });
+
+  it('always writes a non-null profile name with the validated address', async () => {
+    const result = await saveDeliveryAddressForCustomer(73, {
+      recipient_name: 'Robin',
+      recipient_phone: '918878787878',
+      address_line_1: '12 Example Road',
+      city: 'Pune',
+      state: 'Maharashtra',
+      pincode: '411001',
+    }, {
+      SUPABASE_URL: 'https://supabase.example.test',
+      SUPABASE_SERVICE_ROLE_KEY: 'test-service-role-key',
+      SUPABASE_ANON_KEY: 'test-anon-key',
+      OPENAI_API_KEY: 'test-openai-key',
+    } as Parameters<typeof saveDeliveryAddressForCustomer>[2]);
+
+    const addressInsert = supabaseMock.inserts.find(
+      (insert) => insert.table === 'delivery_addresses'
+    );
+    expect(addressInsert?.values).toMatchObject({
+      customer_id: 73,
+      profile_name: 'Robin',
+      recipient_name: 'Robin',
+      is_default: false,
+      is_active: true,
+    });
+    expect(result.profile_name).toBe('Robin');
+  });
+
+  it('updates only the explicitly selected customer address', async () => {
+    const result = await saveDeliveryAddressForCustomer(73, {
+      recipient_name: 'Robin',
+      recipient_phone: '918878787878',
+      address_line_1: '12 New Example Road',
+      city: 'Pune',
+      state: 'Maharashtra',
+      pincode: '411001',
+    }, {
+      SUPABASE_URL: 'https://supabase.example.test',
+      SUPABASE_SERVICE_ROLE_KEY: 'test-service-role-key',
+      SUPABASE_ANON_KEY: 'test-anon-key',
+      OPENAI_API_KEY: 'test-openai-key',
+    } as Parameters<typeof saveDeliveryAddressForCustomer>[2], 99);
+
+    expect(supabaseMock.updates).toContainEqual(expect.objectContaining({
+      table: 'delivery_addresses',
+      values: expect.objectContaining({
+        customer_id: 73,
+        profile_name: 'Robin',
+        address_line_1: '12 New Example Road',
+      }),
+    }));
+    expect(result.id).toBe(99);
   });
 });

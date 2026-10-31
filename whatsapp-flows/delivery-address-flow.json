@@ -1,0 +1,179 @@
+{
+  "version": "6.3",
+  "screens": [
+    {
+      "id": "DELIVERY_ADDRESS",
+      "title": "Delivery Address",
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Form",
+            "name": "delivery_address_form",
+            "children": [
+              {
+                "type": "TextInput",
+                "name": "recipient_name",
+                "label": "Recipient Name",
+                "required": true,
+                "input-type": "text"
+              },
+              {
+                "type": "TextInput",
+                "name": "recipient_phone",
+                "label": "Phone Number",
+                "required": true,
+                "input-type": "phone"
+              },
+              {
+                "type": "TextInput",
+                "name": "email",
+                "label": "Email",
+                "required": true,
+                "input-type": "email"
+              },
+              {
+                "type": "TextInput",
+                "name": "address_line_1",
+                "label": "Address Line 1",
+                "required": true,
+                "input-type": "text"
+              },
+              {
+                "type": "TextInput",
+                "name": "address_line_2",
+                "label": "Address Line 2",
+                "required": true,
+                "input-type": "text"
+              },
+              {
+                "type": "TextInput",
+                "name": "city",
+                "label": "City",
+                "required": true,
+                "input-type": "text"
+              },
+              {
+                "type": "TextInput",
+                "name": "state",
+                "label": "State",
+                "required": true,
+                "input-type": "text"
+              },
+              {
+                "type": "TextInput",
+                "name": "pincode",
+                "label": "Pincode",
+                "required": true,
+                "input-type": "text"
+              },
+              {
+                "type": "TextInput",
+                "name": "landmark",
+                "label": "Landmark",
+                "required": true,
+                "input-type": "text"
+              }
+            ]
+          },
+          {
+            "type": "Footer",
+            "label": "Review Address",
+            "on-click-action": {
+              "name": "navigate",
+              "next": {
+                "type": "screen",
+                "name": "ADDRESS_CONFIRMATION"
+              },
+              "payload": {
+                "recipient_name": "${form.recipient_name}",
+                "recipient_phone": "${form.recipient_phone}",
+                "email": "${form.email}",
+                "address_line_1": "${form.address_line_1}",
+                "address_line_2": "${form.address_line_2}",
+                "city": "${form.city}",
+                "state": "${form.state}",
+                "pincode": "${form.pincode}",
+                "landmark": "${form.landmark}"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "ADDRESS_CONFIRMATION",
+      "title": "Confirm Address",
+      "terminal": true,
+      "data": {
+        "recipient_name": {
+          "type": "string",
+          "__example__": "Robin"
+        },
+        "recipient_phone": {
+          "type": "string",
+          "__example__": "919876543210"
+        },
+        "email": {
+          "type": "string",
+          "__example__": "robin@example.com"
+        },
+        "address_line_1": {
+          "type": "string",
+          "__example__": "12 Example Road"
+        },
+        "address_line_2": {
+          "type": "string",
+          "__example__": "Apartment 2"
+        },
+        "city": {
+          "type": "string",
+          "__example__": "Pune"
+        },
+        "state": {
+          "type": "string",
+          "__example__": "Maharashtra"
+        },
+        "pincode": {
+          "type": "string",
+          "__example__": "411001"
+        },
+        "landmark": {
+          "type": "string",
+          "__example__": "Near station"
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextHeading",
+            "text": "Confirm your delivery address"
+          },
+          {
+            "type": "TextBody",
+            "text": "Name: ${data.recipient_name}\nPhone: ${data.recipient_phone}\nEmail: ${data.email}\nAddress: ${data.address_line_1}\n${data.address_line_2}\nCity: ${data.city}\nState: ${data.state}\nPincode: ${data.pincode}\n${data.landmark}"
+          },
+          {
+            "type": "Footer",
+            "label": "Confirm Address",
+            "on-click-action": {
+              "name": "complete",
+              "payload": {
+                "recipient_name": "${data.recipient_name}",
+                "recipient_phone": "${data.recipient_phone}",
+                "email": "${data.email}",
+                "address_line_1": "${data.address_line_1}",
+                "address_line_2": "${data.address_line_2}",
+                "city": "${data.city}",
+                "state": "${data.state}",
+                "pincode": "${data.pincode}",
+                "landmark": "${data.landmark}"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
