@@ -3034,3 +3034,49 @@ button:where(:not(.save-customer-top-btn)):has(+ .never-match) {
   color: #b42318;
   border: 1px solid #f3c0c0;
 }
+
+.tracking-step {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding-bottom: 30px;
+}
+
+.tracking-dot {
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #e5e7eb;
+  color: #64748b;
+  font-size: 11px;
+  z-index: 1;
+}
+
+.tracking-step.completed .tracking-dot {
+  background: #16a34a;
+  color: white;
+}
+
+.tracking-step.current .tracking-dot {
+  background: #2563eb;
+  color: white;
+}
+
+.tracking-step.completed strong {
+  color: #16a34a;
+}
+
+.tracking-step.current strong {
+  color: #2563eb;
+}
+
+.tracking-step p {
+  margin-top: 5px;
+  color: #64748b;
+  font-size: 12px;
+}
