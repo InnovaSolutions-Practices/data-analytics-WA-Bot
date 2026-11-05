@@ -24,6 +24,13 @@ export default defineConfig(({ command, mode }) => {
                 'Authorization',
                 `Bearer ${env.ADMIN_API_TOKEN}`
               )
+              const authHeader = proxyRequest.getHeader('Authorization')
+console.log(
+  '[API proxy] Bearer token attached:',
+  typeof authHeader === 'string' && authHeader.startsWith('Bearer '),
+  'Token length:',
+  typeof authHeader === 'string' ? authHeader.length - 7 : 0
+)
             })
           },
         },

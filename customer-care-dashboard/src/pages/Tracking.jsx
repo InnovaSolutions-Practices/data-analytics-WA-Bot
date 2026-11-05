@@ -20,7 +20,7 @@ const allowedTransitions = {
 }
 
 const statusLabels = {
-  pending: 'Pending',
+  pending: 'Order Placed',
   payment_pending: 'Payment Pending',
   paid: 'Paid',
   failed: 'Failed',
@@ -28,7 +28,7 @@ const statusLabels = {
   fulfilled: 'Fulfilled',
   PACKED: 'Processing',
   SHIPPED: 'Shipped',
-  OUT_FOR_DELIVERY: 'In Transit',
+  OUT_FOR_DELIVERY: 'Out for Delivery',
   DELIVERED: 'Delivered',
 }
 
@@ -36,20 +36,34 @@ function createTimeline(order) {
   const history = Array.isArray(order.status_history)
     ? order.status_history
     : []
+
   const entries = history.length
     ? history
     : [{ new_status: order.status, created_at: order.created_at }]
 
-  return entries.map((entry) => ({
-    status: statusLabels[entry.new_status] || entry.new_status || 'Order Placed',
-    date: entry.created_at
-      ? new Date(entry.created_at).toLocaleString('en-IN')
-      : '--',
-    completed: true,
-    active: entry.new_status === order.status,
-  }))
-}
+  return entries.map((entry) => {
+    const rawStatus = String(
+      entry.new_status || entry.status || ''
+    ).trim()
 
+    const normalizedStatus = rawStatus.toUpperCase()
+
+    return {
+      status:
+        statusLabels[normalizedStatus] ||
+        statusLabels[rawStatus.toLowerCase()] ||
+        rawStatus ||
+        'Order Placed',
+
+      date: entry.created_at
+        ? new Date(entry.created_at).toLocaleString('en-IN')
+        : '--',
+
+      completed: true,
+      active: normalizedStatus === String(order.status).toUpperCase(),
+    }
+  })
+}
 function Tracking() {
   const [orders, setOrders] = useState([])
   const [search, setSearch] = useState('')

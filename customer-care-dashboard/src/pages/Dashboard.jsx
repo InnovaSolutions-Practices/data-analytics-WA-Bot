@@ -93,8 +93,11 @@ customer:
     (order) => order.status?.toLowerCase() === 'delivered'
   ).length
 
-  const recentOrders = [...orders].slice(-5).reverse()
-
+const recentOrders = [...orders]
+  .sort((a, b) => {
+    return new Date(b.created_at) - new Date(a.created_at)
+  })
+  .slice(0, 5)
   return (
     <>
       <div className="page-heading">

@@ -1,40 +1,78 @@
-
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { getAllOrders, getCustomers } from '../api/customerApi'
-
+import {
+  getAllOrders,
+  getCustomers,
+  getCustomerAddresses,
+} from '../api/customerApi'
 const statusSteps = [
   'Order Placed',
   'Processing',
   'Shipped',
-  'In Transit',
+  'Out for Delivery',
   'Delivered',
 ]
 
 function createTimeline(order) {
-  const history = order.trackingHistory || []
+  const history = Array.isArray(order.trackingHistory)
+    ? order.trackingHistory
+    : []
+
+  const statusMap = {
+    pending: 'Order Placed',
+    order_placed: 'Order Placed',
+    payment_pending: 'Order Placed',
+    paid: 'Order Placed',
+    packed: 'Processing',
+    processing: 'Processing',
+    shipped: 'Shipped',
+    out_for_delivery: 'Out for Delivery',
+    delivered: 'Delivered',
+  }
+
+  const normalize = (value) =>
+    String(value || '')
+      .trim()
+      .toLowerCase()
+      .replaceAll(' ', '_')
+
+  const currentStatus = normalize(order.status)
+  const currentStep = statusMap[currentStatus] || 'Order Placed'
+  const currentIndex = statusSteps.indexOf(currentStep)
 
   return statusSteps.map((step, index) => {
-    const historyItem = history.find(
-      (item) =>
-        String(item.status || '').toLowerCase() === step.toLowerCase()
-    )
+    const historyItem = history.find((item) => {
+      const historyStatus = normalize(
+        item.new_status || item.status
+      )
+      return statusMap[historyStatus] === step
+    })
 
-    return historyItem
-      ? {
-          title: step,
-          time: historyItem.date || '—',
-          state: 'completed',
-          number: '✓',
-        }
-      : {
-          title: step,
-          time: 'Waiting',
-          state: '',
-          number: index + 1,
-        }
+    let state = 'waiting'
+    let number = index + 1
+    let time = 'Waiting'
+
+    if (index < currentIndex) {
+      state = 'completed'
+      number = '✓'
+      time = historyItem?.created_at || historyItem?.date
+        ? formatDate(historyItem.created_at || historyItem.date)
+        : 'Completed'
+    } else if (index === currentIndex) {
+      state = 'current'
+      number = '●'
+      time = 'Current status'
+    }
+
+    return {
+      title: step,
+      time,
+      state,
+      number,
+    }
   })
 }
+
 
 function formatAmount(order) {
   const amount =
@@ -81,12 +119,18 @@ function OrderDetails() {
           getAllOrders(),
           getCustomers().catch(() => []),
         ])
-
+        console.log('CUSTOMERS DATA:', customersData)
         const orders = Array.isArray(ordersData) ? ordersData : []
         const customers = Array.isArray(customersData)
           ? customersData
           : []
-
+          console.table(
+  customers.map((customer) => ({
+    id: customer.id,
+    name: customer.name,
+    keys: Object.keys(customer).join(', '),
+  }))
+)
         const selectedOrder = orders.find(
           (item) => String(item.id) === String(id)
         )
@@ -94,11 +138,31 @@ function OrderDetails() {
         if (!selectedOrder) {
           throw new Error('This order could not be found in the database.')
         }
+        const addresses = await getCustomerAddresses(
+  selectedOrder.customer_id
+)
+const shippingAddress =
+  addresses.find((address) => address.is_default && address.is_active) ||
+  addresses.find((address) => address.is_active) ||
+  null
+
+console.log(
+  'CUSTOMER ADDRESSES:',
+  JSON.stringify(addresses, null, 2)
+)
+       console.log(
+  'FULL ORDER DATA:',
+  JSON.stringify(selectedOrder, null, 2)
+)
 
         const customer = customers.find(
           (item) =>
             String(item.id) === String(selectedOrder.customer_id)
         )
+        console.log(
+  'MATCHED CUSTOMER:',
+  JSON.stringify(customer, null, 2)
+)
 
         if (!cancelled) {
           setOrder({
@@ -119,21 +183,28 @@ function OrderDetails() {
             amount: formatAmount(selectedOrder),
             date: formatDate(selectedOrder.created_at),
             source: selectedOrder.source || 'WhatsApp',
-            trackingId: selectedOrder.tracking_id || null,
-            payment: {
-  status: selectedOrder.status
-    ? selectedOrder.status.replaceAll('_', ' ')
-    : 'Not available',
-  method: selectedOrder.payment_provider || 'Not available',
+           payment: {
+  status:
+    selectedOrder.payment_provider === 'razorpay'
+      ? selectedOrder.paid_at
+        ? 'Paid'
+        : 'Pending'
+      : 'Pending',
+  method: selectedOrder.payment_provider || 'Manual',
+},shippingAddress: {
+  recipientName: shippingAddress?.recipient_name || '',
+  phone: shippingAddress?.recipient_phone || '',
+  address: [
+    shippingAddress?.address_line_1,
+    shippingAddress?.address_line_2,
+    shippingAddress?.landmark,
+  ].filter(Boolean).join(', '),
+  city: shippingAddress?.city || '',
+  state: shippingAddress?.state || '',
+  pincode: shippingAddress?.pincode || '',
+  profileName: shippingAddress?.profile_name || '',
 },
-            shippingAddress: {
-              address: selectedOrder.shipping_address || '',
-              city: selectedOrder.shipping_city || '',
-              state: selectedOrder.shipping_state || '',
-              pincode: selectedOrder.shipping_pincode || '',
-            },
-            trackingHistory: selectedOrder.trackingHistory || [],
-          })
+trackingHistory: selectedOrder.status_history || [],          })
         }
       } catch (err) {
         if (!cancelled) {
@@ -273,9 +344,6 @@ function OrderDetails() {
             <h3>Order Tracking</h3>
             <p>Current delivery progress</p>
           </div>
-          <span className="tracking-id">
-            Tracking ID: {order.trackingId || 'Not assigned'}
-          </span>
         </div>
 
         <div className="tracking-timeline">
