@@ -63,7 +63,12 @@ import { generateAnswer, generateAnswerFromContext, generateRAGResponse, retriev
 import { answerCommerceQuestion } from "./ai-commerce-router";
 import {
 	buildDeliveryAddressFlowMessage,
+	collectDeliveryAddressTextAnswer,
+	extractDeliveryAddressFlowData,
+	getDeliveryAddressTextPrompt,
 	parseDeliveryAddressFlowSubmission,
+	validateCollectedDeliveryAddress,
+	type DeliveryAddressTextStep,
 } from "./whatsapp-flows";
 
 interface Env {
@@ -507,6 +512,7 @@ type DeliveryCollectionStep =
 	| "ADDRESS_CONFIRM"
 	| "FLOW_WAIT"
 	| "FLOW_SAVED"
+	| "ADDRESS_SAVED"
 	| "RECIPIENT_NAME"
 	| "RECIPIENT_PHONE"
 	| "EMAIL"
@@ -517,7 +523,7 @@ type DeliveryCollectionStep =
 	| "PINCODE"
 	| "LANDMARK";
 
-const DELIVERY_STEP_ORDER: readonly string[] = [
+const DELIVERY_STEP_ORDER: readonly DeliveryAddressTextStep[] = [
 	"RECIPIENT_NAME",
 	"RECIPIENT_PHONE",
 	"EMAIL",
@@ -528,6 +534,10 @@ const DELIVERY_STEP_ORDER: readonly string[] = [
 	"PINCODE",
 	"LANDMARK",
 ];
+
+function isDeliveryAddressTextStep(step: DeliveryCollectionStep): step is DeliveryAddressTextStep {
+	return DELIVERY_STEP_ORDER.some((candidate) => candidate === step);
+}
 
 function formatDeliveryAddress(address: Partial<DeliveryAddressInput>): string {
 	return [
@@ -660,7 +670,13 @@ async function handleLegacyDeliveryConversation(
 
 	const context = conversation.context ?? {};
 	if (context.step !== "CHOICE") {
-		throw new Error("Text-based delivery address collection is disabled; launch the WhatsApp Flow");
+		const messageId = crypto.randomUUID();
+		if (env.WHATSAPP_DELIVERY_FLOW_ID?.trim()) {
+			await startDeliveryAddressFlow(sender, context, messageId, env);
+		} else {
+			await startTextDeliveryAddressCollection(sender, context, env, messageId);
+		}
+		return true;
 	}
 	const orderId = Number(context.order_id);
 	if (!Number.isSafeInteger(orderId) || orderId <= 0) {
@@ -767,7 +783,7 @@ async function sendAddressOptionsForOrder(
 		{ ...context, step: "FLOW_WAIT" },
 		"yes"
 	);
-	await sendDeliveryFlowPrompt(sender, context, env);
+	await sendDeliveryFlowPrompt(sender, context, env, "yes");
 }
 
 async function startCheckoutAddressCollection(
@@ -811,26 +827,22 @@ async function startCheckoutAddressCollection(
 		{ ...context, step: "FLOW_WAIT" },
 		messageId
 	);
-	await sendDeliveryFlowPrompt(sender, context, env);
+	await sendDeliveryFlowPrompt(sender, context, env, messageId);
 }
 
 async function sendDeliveryFlowPrompt(
 	sender: string,
 	context: Record<string, unknown>,
-	env: Env
+	env: Env,
+	messageId = crypto.randomUUID()
 ): Promise<void> {
 	const flowId = env.WHATSAPP_DELIVERY_FLOW_ID?.trim();
 	if (!flowId) {
-		console.error("[FLOW] Flow not configured", {
+		console.warn("[FLOW] Delivery Flow is not configured; using chat address collection", {
 			recipient: maskPhoneNumber(sender),
 		});
-		await leaveFlowUnavailableState(sender, context, env);
-		await sendWhatsAppMessage(
-			sender,
-			"Delivery Address Flow is not configured right now. Please try again later.",
-			env
-		);
-		throw new Error("Flow not configured");
+		await startTextDeliveryAddressCollection(sender, context, env, messageId);
+		return;
 	}
 
 	const payload = buildDeliveryAddressFlowMessage(sender, flowId, crypto.randomUUID());
@@ -852,37 +864,37 @@ async function sendDeliveryFlowPrompt(
 			metaMessageId: result.metaMessageId,
 		});
 	} catch (error) {
-		console.error("[FLOW] WhatsApp response:", {
+		console.error("[FLOW] Delivery Flow launch failed", {
 			error: error instanceof Error ? error.message : String(error),
 			recipient: maskPhoneNumber(sender),
 		});
-		await leaveFlowUnavailableState(sender, context, env);
-		await sendWhatsAppMessage(
-			sender,
-			"Delivery Address Flow could not be opened. Please try again later.",
-			env
-		);
 		throw error;
 	}
 }
 
-async function leaveFlowUnavailableState(
+async function startTextDeliveryAddressCollection(
 	sender: string,
 	context: Record<string, unknown>,
-	env: Env
+	env: Env,
+	messageId: string
 ): Promise<void> {
-	const savedAddressId = Number(context.address_id);
-	if (Number.isSafeInteger(savedAddressId) && savedAddressId > 0) {
-		await upsertConversationState(
-			sender,
-			"DELIVERY_DETAILS",
-			env,
-			{ ...context, step: "ADDRESS_CHOICE" },
-			"flow_unavailable"
-		);
-		return;
-	}
-	await upsertConversationState(sender, "MAIN_MENU", env, {}, "flow_unavailable");
+	const fallbackContext = {
+		...context,
+		step: "RECIPIENT_NAME",
+		delivery: {},
+	};
+	await upsertConversationState(sender, "DELIVERY_DETAILS", env, fallbackContext, messageId);
+	await sendWhatsAppMessage(
+		sender,
+		[
+			"I'll collect your delivery address here in chat instead.",
+			"",
+			getDeliveryAddressTextPrompt("RECIPIENT_NAME"),
+			"",
+			"Reply CANCEL at any time to stop.",
+		].join("\n"),
+		env
+	);
 }
 
 async function finishCheckoutWithDeliveryAddress(
@@ -895,7 +907,26 @@ async function finishCheckoutWithDeliveryAddress(
 	await ensurePendingOrderDelivery(order.id, env);
 	const { address } = await linkSavedDeliveryAddressToOrder(order.id, sender, addressId, env);
 
-	const paymentLink = await createCommercePaymentLink(order, env);
+	let paymentLink: Awaited<ReturnType<typeof createCommercePaymentLink>>;
+	try {
+		paymentLink = await createCommercePaymentLink(order, env);
+	} catch (error) {
+		console.error("[CHECKOUT PAYMENT LINK FAILED]", {
+			orderId: order.id,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		await upsertConversationState(sender, "MAIN_MENU", env, {}, messageId);
+		await sendWhatsAppMessage(
+			sender,
+			[
+				`Your order #${order.id} and delivery address have been saved, but we couldn't create the payment link.`,
+				"",
+				"Please contact customer support with your order number before placing another order.",
+			].join("\n"),
+			env
+		);
+		return;
+	}
 	await updateOrderPaymentLink(order.id, paymentLink.id, paymentLink.short_url, env);
 	await upsertConversationState(sender, "MAIN_MENU", env, {}, messageId);
 	await sendWhatsAppMessage(
@@ -915,6 +946,56 @@ async function finishCheckoutWithDeliveryAddress(
 	);
 }
 
+async function saveAndContinueWithDeliveryAddress(
+	sender: string,
+	messageId: string,
+	context: Record<string, unknown>,
+	address: DeliveryAddressInput,
+	env: Env
+): Promise<void> {
+	const customerId = Number(context.customer_id);
+	if (!Number.isSafeInteger(customerId) || customerId <= 0) {
+		throw new Error("Customer is missing from delivery address context");
+	}
+	const updateAddressId = Number(context.update_address_id);
+	const addressRecord = await saveDeliveryAddressForCustomer(
+		customerId,
+		address,
+		env,
+		Number.isSafeInteger(updateAddressId) && updateAddressId > 0
+			? updateAddressId
+			: undefined
+	);
+	await upsertConversationState(
+		sender,
+		"DELIVERY_DETAILS",
+		env,
+		{ ...context, step: "ADDRESS_SAVED", address_id: addressRecord.id, delivery: address },
+		messageId
+	);
+
+	if (context.source === "CHECKOUT_DELIVERY") {
+		await finishCheckoutWithDeliveryAddress(sender, messageId, addressRecord.id, env);
+		return;
+	}
+
+	const orderId = Number(context.order_id);
+	if (!Number.isSafeInteger(orderId) || orderId <= 0) {
+		throw new Error("Order is missing from delivery address context");
+	}
+	const linked = await linkSavedDeliveryAddressToOrder(orderId, sender, addressRecord.id, env);
+	await upsertConversationState(sender, "MAIN_MENU", env, {}, messageId);
+	await sendWhatsAppMessage(
+		sender,
+		[
+			`✅ Delivery address confirmed for order #${orderId}.`,
+			"",
+			formatDeliveryAddress(linked.address),
+		].join("\n"),
+		env
+	);
+}
+
 async function startDeliveryAddressFlow(
 	sender: string,
 	context: Record<string, unknown>,
@@ -929,15 +1010,44 @@ async function startDeliveryAddressFlow(
 		flowContext,
 		messageId
 	);
-	await sendDeliveryFlowPrompt(sender, flowContext, env);
+	await sendDeliveryFlowPrompt(sender, flowContext, env, messageId);
 }
 
 async function handleDeliveryFlowSubmission(
 	sender: string,
-	responseJson: string,
+	submission: {
+		responseJson: unknown;
+		flowActionData: unknown;
+		flowToken: unknown;
+	},
 	env: Env,
 	messageId: string
 ): Promise<boolean> {
+	let flowData: Record<string, unknown> = {};
+	let flowDataError: unknown;
+	try {
+		flowData = extractDeliveryAddressFlowData(
+			submission.responseJson,
+			submission.flowActionData
+		);
+		console.log("[FLOW EXTRACTED KEYS]", Object.keys(flowData));
+		console.log("[FLOW EXTRACTED DATA]", JSON.stringify(flowData, null, 2));
+		console.log("[FLOW EXPECTED SCHEMA]", {
+			required: ["recipient_name", "recipient_phone", "address_line_1", "city", "state", "pincode"],
+			optional: ["email", "address_line_2", "landmark"],
+		});
+		console.log("[FLOW SUBMISSION METADATA]", {
+			hasResponseJson: submission.responseJson !== undefined && submission.responseJson !== null,
+			hasFlowActionData: submission.flowActionData !== undefined && submission.flowActionData !== null,
+			hasFlowToken: typeof submission.flowToken === "string" && Boolean(submission.flowToken),
+		});
+	} catch (error) {
+		flowDataError = error;
+		console.warn("[FLOW DATA EXTRACTION ERROR]", {
+			error: error instanceof Error ? error.message : "Unable to extract WhatsApp Flow data",
+		});
+	}
+
 	const conversation = await getConversationState(sender, env);
 	if (!conversation || conversation.state !== "DELIVERY_DETAILS") {
 		console.warn("[WHATSAPP_FLOW_SUBMISSION_IGNORED]", {
@@ -965,11 +1075,32 @@ async function handleDeliveryFlowSubmission(
 
 	let address: DeliveryAddressInput;
 	try {
-		address = parseDeliveryAddressFlowSubmission(responseJson);
+		if (flowDataError) {
+			throw flowDataError;
+		}
+		address = parseDeliveryAddressFlowSubmission(flowData);
 	} catch (error) {
 		const validationMessage = error instanceof Error ? error.message : "The address details are invalid.";
+		const missingFields = [...validationMessage.matchAll(/Missing required field: ([a-z_]+)/g)]
+			.map((match) => match[1]);
+		const validationFieldMatchers: Array<[RegExp, string]> = [
+			[/recipient name/i, "recipient_name"],
+			[/phone/i, "recipient_phone"],
+			[/email/i, "email"],
+			[/address/i, "address_line_1"],
+			[/city/i, "city"],
+			[/state/i, "state"],
+			[/pincode|pin code/i, "pincode"],
+			[/landmark/i, "landmark"],
+		];
+		const failingFields = missingFields.length
+			? missingFields
+			: validationFieldMatchers
+				.filter(([pattern]) => pattern.test(validationMessage))
+				.map(([, field]) => field);
 		console.warn("[WHATSAPP_FLOW_VALIDATION_ERROR]", {
 			error: validationMessage,
+			failingFields,
 			recipient: maskPhoneNumber(sender),
 		});
 		await upsertConversationState(
@@ -984,52 +1115,76 @@ async function handleDeliveryFlowSubmission(
 			`The address details could not be validated (${validationMessage}). Please submit the Delivery Address form again.`,
 			env
 		);
-		await sendDeliveryFlowPrompt(sender, context, env);
+		await sendDeliveryFlowPrompt(sender, context, env, messageId);
 		return true;
 	}
 
-	const customerId = Number(context.customer_id);
-	if (!Number.isSafeInteger(customerId) || customerId <= 0) {
-		throw new Error("Customer is missing from delivery Flow context");
-	}
-	const updateAddressId = Number(context.update_address_id);
-	const addressRecord = await saveDeliveryAddressForCustomer(
-		customerId,
-		address,
-		env,
-		Number.isSafeInteger(updateAddressId) && updateAddressId > 0
-			? updateAddressId
-			: undefined
-	);
-	const savedContext = {
-		...context,
-		step: "FLOW_SAVED",
-		address_id: addressRecord.id,
-		delivery: address,
-	};
-	await upsertConversationState(sender, "DELIVERY_DETAILS", env, savedContext, messageId);
-
-	if (context.source === "CHECKOUT_DELIVERY") {
-		await finishCheckoutWithDeliveryAddress(sender, messageId, addressRecord.id, env);
-		return true;
-	}
-
-	const orderId = Number(context.order_id);
-	if (!Number.isSafeInteger(orderId) || orderId <= 0) {
-		throw new Error("Order is missing from delivery Flow context");
-	}
-	const linked = await linkSavedDeliveryAddressToOrder(orderId, sender, addressRecord.id, env);
-	await upsertConversationState(sender, "MAIN_MENU", env, {}, messageId);
-	await sendWhatsAppMessage(
-		sender,
-		[
-			`✅ Delivery address confirmed for order #${orderId}.`,
-			"",
-			formatDeliveryAddress(linked.address),
-		].join("\n"),
-		env
-	);
+	await saveAndContinueWithDeliveryAddress(sender, messageId, context, address, env);
 	return true;
+}
+
+async function handleTextDeliveryAddressStep(
+	sender: string,
+	incomingText: string,
+	context: Record<string, unknown>,
+	step: DeliveryAddressTextStep,
+	messageId: string,
+	env: Env
+): Promise<void> {
+	const answer = incomingText.trim();
+	if (/^cancel$/i.test(answer)) {
+		await upsertConversationState(sender, "MAIN_MENU", env, {}, messageId);
+		await sendWhatsAppMessage(sender, "Delivery address collection cancelled. Your cart is unchanged.", env);
+		return;
+	}
+
+	const currentAddress = readDeliveryAddressDraft(context.delivery);
+	let progress: ReturnType<typeof collectDeliveryAddressTextAnswer>;
+	try {
+		progress = collectDeliveryAddressTextAnswer(step, currentAddress, answer);
+	} catch (error) {
+		const validationMessage = error instanceof Error ? error.message : "That answer is not valid.";
+		await sendWhatsAppMessage(
+			sender,
+			`${validationMessage}\n${getDeliveryAddressTextPrompt(step)}`,
+			env
+		);
+		return;
+	}
+
+	if (progress.nextStep) {
+		await upsertConversationState(
+			sender,
+			"DELIVERY_DETAILS",
+			env,
+			{ ...context, step: progress.nextStep, delivery: progress.address },
+			messageId
+		);
+		await sendWhatsAppMessage(sender, getDeliveryAddressTextPrompt(progress.nextStep), env);
+		return;
+	}
+
+	const address = validateCollectedDeliveryAddress(progress.address);
+	await saveAndContinueWithDeliveryAddress(sender, messageId, context, address, env);
+}
+
+function readDeliveryAddressDraft(value: unknown): Partial<DeliveryAddressInput> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return {};
+	}
+	const draft = value as Record<string, unknown>;
+	return {
+		profile_name: typeof draft.profile_name === "string" ? draft.profile_name : null,
+		recipient_name: typeof draft.recipient_name === "string" ? draft.recipient_name : undefined,
+		recipient_phone: typeof draft.recipient_phone === "string" ? draft.recipient_phone : undefined,
+		email: typeof draft.email === "string" ? draft.email : null,
+		address_line_1: typeof draft.address_line_1 === "string" ? draft.address_line_1 : undefined,
+		address_line_2: typeof draft.address_line_2 === "string" ? draft.address_line_2 : null,
+		city: typeof draft.city === "string" ? draft.city : undefined,
+		state: typeof draft.state === "string" ? draft.state : undefined,
+		pincode: typeof draft.pincode === "string" ? draft.pincode : undefined,
+		landmark: typeof draft.landmark === "string" ? draft.landmark : null,
+	};
 }
 
 async function handleDeliveryConversation(
@@ -1052,19 +1207,41 @@ async function handleDeliveryConversation(
 			await sendWhatsAppMessage(sender, "Your delivery address has been saved. Please wait while checkout continues.", env);
 			return true;
 		}
+		await sendDeliveryFlowPrompt(sender, context, env, messageId);
+		return true;
+	}
+	if (step === "ADDRESS_SAVED") {
 		await sendWhatsAppMessage(
 			sender,
-			"Please complete the Delivery Address form to continue. No text address form is active.",
+			"Your delivery address is saved. If you have not received order and payment confirmation, contact customer support before placing another order.",
 			env
 		);
 		return true;
 	}
 	if (
 		step === "ADDRESS_FORM" ||
-		step === "ADDRESS_CONFIRM" ||
-		DELIVERY_STEP_ORDER.includes(step)
+		step === "ADDRESS_CONFIRM"
 	) {
-		await startDeliveryAddressFlow(sender, context, messageId, env);
+		if (env.WHATSAPP_DELIVERY_FLOW_ID?.trim()) {
+			await startDeliveryAddressFlow(sender, context, messageId, env);
+		} else {
+			await startTextDeliveryAddressCollection(sender, context, env, messageId);
+		}
+		return true;
+	}
+	if (isDeliveryAddressTextStep(step)) {
+		if (env.WHATSAPP_DELIVERY_FLOW_ID?.trim()) {
+			await startDeliveryAddressFlow(sender, context, messageId, env);
+		} else {
+			await handleTextDeliveryAddressStep(
+				sender,
+				incomingText,
+				context,
+				step,
+				messageId,
+				env
+			);
+		}
 		return true;
 	}
 	if (step === "CHOICE") {
@@ -1102,13 +1279,13 @@ async function handleDeliveryConversation(
 			if (address) {
 				await sendDeliveryAddressChoicePrompt(sender, address, env);
 			} else {
-				await startDeliveryAddressFlow(sender, context, buttonId || answer, env);
+				await startDeliveryAddressFlow(sender, context, messageId, env);
 			}
 			return true;
 		}
 
 		if (addNew) {
-			await startDeliveryAddressFlow(sender, context, answer || buttonId, env);
+			await startDeliveryAddressFlow(sender, context, messageId, env);
 			return true;
 		}
 
@@ -6914,11 +7091,32 @@ if (request.method === "PATCH" && addressDefaultMatch) {
 				await recordWhatsAppDeliveryStatuses(body, env);
 			}
 
-			const message =
-				body.entry?.[0]
-					?.changes?.[0]
-					?.value
-					?.messages?.[0];
+			const webhookMessages = (body.entry ?? []).flatMap((entry: any) =>
+				(entry.changes ?? []).flatMap((change: any) =>
+					change.value?.messages ?? []
+				)
+			);
+			const flowMessage = webhookMessages.find((candidate: any) =>
+				candidate.interactive?.nfm_reply !== undefined ||
+				candidate.interactive?.flow_action_data !== undefined ||
+				candidate.flow_action_data !== undefined
+			);
+			const message = flowMessage ?? webhookMessages[0];
+			const flowReply = message?.interactive?.nfm_reply;
+			const flowActionData =
+				flowReply?.flow_action_data ??
+				message?.interactive?.flow_action_data ??
+				message?.flow_action_data;
+			const flowToken =
+				flowReply?.flow_token ??
+				message?.interactive?.flow_token ??
+				message?.flow_token;
+			const isFlowSubmission =
+				flowReply !== undefined && flowReply !== null ||
+				flowActionData !== undefined;
+			if (isFlowSubmission) {
+				console.log("[FLOW RAW SUBMISSION]", JSON.stringify(body, null, 2));
+			}
 
 			/*
 			 * Sent, delivered and read status events
@@ -6954,10 +7152,7 @@ if (request.method === "PATCH" && addressDefaultMatch) {
 				message.interactive
 					?.list_reply
 					?.id ?? "";
-			const flowResponseJson =
-				message.interactive
-					?.nfm_reply
-					?.response_json;
+			const flowResponseJson = flowReply?.response_json;
 
 			console.log(
 				"Parsed WhatsApp input:",
@@ -6973,8 +7168,12 @@ if (request.method === "PATCH" && addressDefaultMatch) {
 			ctx.waitUntil(
 				(async () => {
 					try {
-						if (typeof flowResponseJson === "string" &&
-							await handleDeliveryFlowSubmission(sender, flowResponseJson, env, messageId)) {
+						if (isFlowSubmission &&
+							await handleDeliveryFlowSubmission(sender, {
+								responseJson: flowResponseJson,
+								flowActionData,
+								flowToken,
+							}, env, messageId)) {
 							console.log("[WEBHOOK BRANCH RETURN] WhatsApp delivery address Flow");
 							return;
 						}

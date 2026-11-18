@@ -16,6 +16,7 @@ vi.mock('@supabase/supabase-js', () => ({
 }));
 
 import {
+  createRazorpayPaymentLink,
   createOrderFromCart,
   saveDeliveryAddressForCustomer,
 } from '../src/commerce';
@@ -252,5 +253,44 @@ describe('saveDeliveryAddressForCustomer', () => {
       }),
     }));
     expect(result.id).toBe(99);
+  });
+});
+
+describe('createRazorpayPaymentLink', () => {
+  it('fails clearly when Razorpay credentials are missing without making a provider request', async () => {
+    const order = {
+      id: 42,
+      customer_id: customer.id,
+      customer_phone: customer.whatsapp_number,
+      meta_message_id: null,
+      status: 'pending',
+      subtotal: 250,
+      tax: 0,
+      total_amount: 250,
+      currency: 'INR',
+      payment_provider: 'razorpay',
+      razorpay_payment_link_id: null,
+      razorpay_payment_link_url: null,
+      razorpay_payment_id: null,
+      paid_at: null,
+      created_at: '2026-01-01T00:00:00.000Z',
+      updated_at: '2026-01-01T00:00:00.000Z',
+    };
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    try {
+      await expect(createRazorpayPaymentLink(order, {
+        SUPABASE_URL: 'https://supabase.example.test',
+        SUPABASE_SERVICE_ROLE_KEY: 'test-service-role-key',
+        SUPABASE_ANON_KEY: 'test-anon-key',
+        OPENAI_API_KEY: 'test-openai-key',
+        RAZORPAY_KEY_ID: '',
+        RAZORPAY_KEY_SECRET: '',
+        RAZORPAY_WEBHOOK_SECRET: 'test-webhook-secret',
+      })).rejects.toThrow('RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET');
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });

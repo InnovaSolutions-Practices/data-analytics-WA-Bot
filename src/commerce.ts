@@ -2055,6 +2055,10 @@ export async function createRazorpayPaymentLink(
   order: OrderRecord,
   env: CommerceEnv
 ): Promise<{ id: string; short_url: string }> {
+  if (!env.RAZORPAY_KEY_ID?.trim() || !env.RAZORPAY_KEY_SECRET?.trim()) {
+    throw new Error('Razorpay payment-link configuration requires RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET');
+  }
+
   const basicAuth = btoa(`${env.RAZORPAY_KEY_ID}:${env.RAZORPAY_KEY_SECRET}`);
   const response = await fetch('https://api.razorpay.com/v1/payment_links', {
     method: 'POST',

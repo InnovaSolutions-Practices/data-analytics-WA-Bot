@@ -5,6 +5,7 @@ SUPABASE_SERVICE_ROLE_KEY=
 WHATSAPP_TOKEN=
 PHONE_NUMBER_ID=
 WHATSAPP_APP_SECRET=
+# Optional: without this published Meta Flow ID, checkout collects the address in chat.
 WHATSAPP_DELIVERY_FLOW_ID=
 
 RAZORPAY_KEY_ID=

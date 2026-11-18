@@ -892,25 +892,26 @@ Checkout collects or selects a delivery address before creating an order:
 
 - `CHECKOUT_CART` loads the customer's active saved addresses from `delivery_addresses`.
 - If an address exists, the customer can use it or add a new one. Otherwise, checkout asks for a new address.
-- Add New Address launches the WhatsApp Flow defined in `whatsapp-flows/delivery-address-flow.json`; its published Meta Flow must be named `Delivery Address`.
-- The Worker reads the Flow ID from `WHATSAPP_DELIVERY_FLOW_ID`. Configure it in local `.dev.vars` for development and as a Worker environment variable for deployed environments.
+- Add New Address launches the WhatsApp Flow defined in `whatsapp-flows/delivery-address-flow.json` when the published Meta Flow ID is configured.
+- The Worker reads the Flow ID from `WHATSAPP_DELIVERY_FLOW_ID`. Configure it locally in `.dev.vars`; for deployed Workers, configure it with `npx wrangler secret put WHATSAPP_DELIVERY_FLOW_ID` (the Flow ID is an identifier, not an API credential, but may be stored as a secret).
 - The Flow returns structured JSON in the inbound `interactive.nfm_reply.response_json` webhook. The Worker validates it and creates a delivery-address row, or updates a row only when an address ID was set in trusted conversation context.
-- The checkout Flow launch does not automatically switch to text address collection. Missing Flow configuration or a failed Meta launch is logged and reported without sending the address text template. A customer text reply while the Flow is open does not switch collection modes.
+- If the Flow ID is missing, the Worker logs a warning and collects the address in a multi-turn WhatsApp chat instead. It validates each answer, saves the address through the same delivery-address service, then continues order creation and Razorpay payment-link generation. If a Flow ID is configured but Meta rejects the launch, the Worker logs and surfaces that failure; it does not switch to chat collection.
 - The Flow includes an address review/confirmation screen. After submission, the Worker persists and links the address, then sends the order/payment confirmation without asking follow-up address questions.
 - Address inserts always set `profile_name` to the supplied profile name, recipient name, or `Primary Address`.
 - Checkout creates/updates the address, creates the order and order items, initializes `order_delivery_details`, then creates and sends the payment link.
+- If Razorpay payment-link creation fails (including missing `RAZORPAY_KEY_ID` or `RAZORPAY_KEY_SECRET`), the address and order remain saved; the Worker tells the customer to contact support with the order number instead of reporting a generic checkout failure.
 - Address selection is restricted to active addresses owned by the order's customer.
 
 There is no database transaction spanning these operations.
 
-The post-payment delivery-details flow remains available for legacy orders without a linked address and uses the same address choice, Flow form, and validation. Legacy persisted text-form states are redirected to the native Flow; text-based address collection is disabled.
+The post-payment delivery-details flow remains available for legacy orders without a linked address and uses the same address choice and address persistence. The native Flow is preferred, with the same chat-based address fallback when it is unavailable.
 
 ### Publishing the delivery Flow in Meta
 
 1. Use WhatsApp Manager's Flow tools or the Meta Flows API with the WhatsApp Business Account ID and a token authorized for that account.
 2. Create and publish a Flow named `Delivery Address`, with category `OTHER`, using the contents of `whatsapp-flows/delivery-address-flow.json` as the `flow_json` parameter. The API create operation accepts `name`, `categories`, `flow_json`, and `publish: true`.
 3. Check the API result for validation errors and retain the returned Flow `id`.
-4. Set `WHATSAPP_DELIVERY_FLOW_ID` to that ID in local `.dev.vars` and as a secret/variable for the deployed Worker environment.
+4. Set `WHATSAPP_DELIVERY_FLOW_ID` to that ID in local `.dev.vars`; for a deployed Worker run `npx wrangler secret put WHATSAPP_DELIVERY_FLOW_ID` and provide the ID when prompted. See [WHATSAPP_DELIVERY_FLOW.md](./WHATSAPP_DELIVERY_FLOW.md) for field definitions and example webhook payloads.
 5. Ensure the WhatsApp Business account is eligible to send Flows and the Cloud API message permissions are configured. Then exercise the form using a real WhatsApp client.
 
 This Flow uses a client-side `complete` action and does not use a Flow data endpoint, so it requires no Flow endpoint encryption key or additional endpoint deployment.

@@ -2,7 +2,7 @@
   "version": "6.3",
   "screens": [
     {
-      "id": "DELIVERY_ADDRESS",
+      "id": "DETAILS",
       "title": "Delivery Address",
       "layout": {
         "type": "SingleColumnLayout",
@@ -29,7 +29,7 @@
                 "type": "TextInput",
                 "name": "email",
                 "label": "Email",
-                "required": true,
+                "required": false,
                 "input-type": "email"
               },
               {
@@ -43,7 +43,7 @@
                 "type": "TextInput",
                 "name": "address_line_2",
                 "label": "Address Line 2",
-                "required": true,
+                "required": false,
                 "input-type": "text"
               },
               {
@@ -71,7 +71,7 @@
                 "type": "TextInput",
                 "name": "landmark",
                 "label": "Landmark",
-                "required": true,
+                "required": false,
                 "input-type": "text"
               }
             ]
